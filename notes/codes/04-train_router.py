@@ -36,6 +36,10 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+# no quality assurance, 린터에게 규칙위반 직접 고지해서 skip하도록 함
+# E402 == pycodestyle 규칙 번호, import 는 원래 최상단인데, src/경로 문제 때문에
+# 위의 REPO_ROOT 인자에서 경로 처리를 한 이후에 import(구현한 모듈)해야 함.
+
 from ossp_router.heuristic import (  # noqa: E402
     _TEAM_DENSE_FEATURE_NAMES,
     _team_raw_feature_vector,
@@ -51,6 +55,73 @@ from ossp_router.protocol import (  # noqa: E402
     load_outcomes,
     policy_sha256,
 )
+
+""" RoutingPolicy : src/ossp_router/resources/routing-policy.v1.json)
+
+"models": {
+  "ax31-light":  {"fixed_cost": "0", "input_token_rate": "1",     "output_token_rate": "4"},
+  "ax31":        {"fixed_cost": "0", "input_token_rate": "2.127", "output_token_rate": "8.509"},
+  "axk1-think":  {"fixed_cost": "0", "input_token_rate": "6.565", "output_token_rate": "26.260"}
+},
+"tiers": {
+  "fast":     {"budget_multiplier": "1.25", "weight": "0.4"},
+  "balanced": {"budget_multiplier": "2.0",  "weight": "0.3"},
+  "premium":  {"budget_multiplier": "4.0",  "weight": "0.3"}
+}
+
+그대로 가져다 사용하는 것.
+티어별 budget, model별 token rate 등 들어있음.
+(요금표+등급규칙 모음 객체)
+"""
+""" InputBatch, OutcomeBatch
+class Episode:       episode_id, prompt(선택), messages(선택)
+class InputBatch:     schema_version, challenge_id, split, episodes: Episode들의 튜플
+(문항 여러 개를 하나로 묶어 input 배치 만든게 InputBatch. Episode 를 여러개 묶음.)
+
+class Outcome:        episode_id, model_id, score, num_generations, input_tokens, output_tokens
+class OutcomeBatch:    schema_version, challenge_id, split, outcomes: Outcome들의 튜플
+
+---
+
+inputs.episodes  = [Episode("ep-001", prompt="리스트 정렬해줘"), Episode("ep-002", ...), ...]
+InputBatch :
+{
+  "schema_version": 1, "challenge_id": "...", "split": "train",
+  "episodes": [
+    {"episode_id": "train-0001", "prompt": "Round -63865955 to the nearest one hundred thousand."},
+    ... (총 1,760개)
+  ]
+}
+
+outcomes.outcomes = [
+  Outcome("ep-001", "ax31-light", score=0.7, input_tokens=50, output_tokens=120),
+  Outcome("ep-001", "ax31",       score=0.9, input_tokens=50, output_tokens=95),
+  Outcome("ep-001", "axk1-think", score=0.85, input_tokens=50, output_tokens=310),
+  Outcome("ep-002", "ax31-light", ...),
+  ...
+]
+
+OutcomeBatch :
+{
+  "episode_id": "train-0001",
+  "models": {
+    "ax31":       {"input_tokens": 110, "output_tokens": 229, "score": "0.5", "num_generations": 2},
+    "ax31-light": {"input_tokens": 112, ...},
+    "axk1-think": {...}
+  }
+}
+=> 문항 하나 안에 모델 3개 결과가 묶여있는 모양임.ㄱ
+parse_outcomes 함수 참조 : 원본은 문항별로 묶은 모양 => 파싱 => outcom튜플에 담기
+
+n차원을 1차원 데이터로 flatten하는 느낌..
+원본 json을 flatten 해서 Outcome 객체 여러개로 만들고(문항x모델 =개별 결과 하나하나, 5280개)
+이걸 묶어서 OutcomeBatch로 하여 부가정보추가+Outcome 을 배치로 관리하는 것. 
+
+
+inputs.episodes는 문항 1,760개짜리 목록,
+outcomes.outcomes는 문항×모델 3개 = 5,280개짜리 평평한(flat) 목록.
+
+"""
 
 
 def _outcome_cost(outcome, policy: RoutingPolicy) -> float:
@@ -71,19 +142,48 @@ def build_training_matrix(
     inputs: InputBatch, outcomes: OutcomeBatch, policy: RoutingPolicy, hash_bins: int
 ) -> Tuple[Any, Any]:
     outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
+
+    """outcomes.outcomes = [
+    Outcome("ep-001", "ax31-light", score=0.7, input_tokens=50, output_tokens=120),
+    Outcome("ep-001", "ax31",       score=0.9, input_tokens=50, output_tokens=95),
+    Outcome("ep-001", "axk1-think", score=0.85, input_tokens=50, output_tokens=310),
+    Outcome("ep-002", "ax31-light", ...),
+    ...
+    ]
+
+    =>
+    {
+        ("ep1", "ax31"): Outcome(...),
+        ("ep1", "ax31-light"): Outcome(...),
+        ("ep1", "axk1-think"): Outcome(...),
+        ("ep2", "ax31"): Outcome(...),
+        ...
+    } ('문항별 모델결과' 매핑, 이렇게 해야 쉽게 찾을 수 있음)
+    
+    """
+
     expected = {
         (episode.episode_id, model_id)
         for episode in inputs.episodes
         for model_id in MODEL_IDS
-    }
+    } 
+    # set 구성. 바깥 for문에서는 episodes 돌고 안쪽은 모델 3개 돌아서
+    # 1,760×3개의 (episode_id, model_id) 짝 세트 == 문항,모델 짝 집합
+    # expected == inputs.json, MODEL_IDS(코드 상수) 에서 만들어낸 값.
+    # 위의 outcomes 랑 직접적인 관계 없음
+
+
     if set(outcome_index) != expected:
         raise ValueError("Train outcome 행렬이 입력과 모델 전체를 포함하지 않습니다.")
+    # 일치하지 않는 경우를 방지. (데이터 결실, 처리 실패 등)
+
 
     matrix = np.asarray(
         [_team_raw_feature_vector(episode, hash_bins) for episode in inputs.episodes],
         dtype=np.float64,
     )
     targets = []
+    
     for episode in inputs.episodes:
         rows = [outcome_index[(episode.episode_id, m)] for m in MODEL_IDS]
         scores = [float(row.score) for row in rows]
@@ -143,6 +243,8 @@ def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[flo
     return best_alpha
 
 
+# ==== main ==== # 
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--train-input", type=Path, required=True)
@@ -151,12 +253,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    policy = load_bundled_policy()
+    policy = load_bundled_policy() # 내장 정책 파일 읽어오기. (RoutingPolicy)
+
     inputs = load_input(args.train_input)
     outcomes = load_outcomes(args.train_outcomes)
 
     print(f"학습 문항 수: {len(inputs.episodes)}  hash_bins={args.hash_bins}")
+
     matrix, targets = build_training_matrix(inputs, outcomes, policy, args.hash_bins)
+
     print(f"특징 행렬: {matrix.shape}  타깃: {targets.shape}")
 
     model_count = len(MODEL_IDS)
