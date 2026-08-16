@@ -31,6 +31,7 @@ dist/
 .idea/
 notes/*
 !notes/codes/
+!notes/@ IDEA.md
 
 # 학습 산출물
 /models/
