@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright 2026 difficcd
+# SPDX-License-Identifier: Apache-2.0
+#
+# 원본: .gitignore, 26~35행 (기존 파일 맨 아래 추가된 부분만)
+# 그 위(1~25행)는 SKT 원본 그대로라서 생략
+
+# ==== 추가 ==== #
+
+.obsidian/
+.claude/
+.vscode/
+.idea/
+notes/
+
+# 학습 산출물
+/models/

@@ -29,7 +29,8 @@ dist/
 .claude/
 .vscode/
 .idea/
-notes/
+notes/*
+!notes/codes/
 
-# 학습 산출물 
+# 학습 산출물
 /models/
