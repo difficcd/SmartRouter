@@ -184,3 +184,7 @@ sLLM 파인튜닝을 해볼만할 것 같기도 한데?
 다시 해보면 성능이 더 좋아지지 않을까?
 
 => 지금 해야할 곳의 IDEA
+
+---
+
+`messages`(멀티턴) 입력은 공식 규칙상 실전에서도 허용되는데 Train/Dev엔 단 한 건도 없어서(toy에만 존재), 라우터가 대응하는 것은 실측 확인했지만(`team_router_make_submission`으로 toy-002 통과) 예측 정확도는 검증 불가 — `episode_text`가 messages를 합칠 때 role(system/user/assistant)을 버리는 것도 잠재 손실 지점.
