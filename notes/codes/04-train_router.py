@@ -125,24 +125,40 @@ outcomes.outcomes는 문항×모델 3개 = 5,280개짜리 평평한(flat) 목록
 
 
 def _outcome_cost(outcome, policy: RoutingPolicy) -> float:
-    rates = policy.models[outcome.model_id]
-    unit = Decimal(policy.token_unit)
+    # policy.v1.schema ref.
+
+    rates = policy.models[outcome.model_id]     # 모델을 사용할 때 매겨지는 비용 단가표
+    unit = Decimal(policy.token_unit)           # 토큰 계산 기준 단위 (예: 1000토큰 기준 등)
+
+    # models[req]=>rates mapping : fixed_cost, input_tokens, output_tokens
+    # policy.v1.schema.json : "$ref": "#/$defs/rates"
+
     cost = (
         rates.fixed_cost
         + Decimal(outcome.input_tokens) * rates.input_token_rate / unit
         + Decimal(outcome.output_tokens) * rates.output_token_rate / unit
     )
-    value = float(cost)
-    if not math.isfinite(value) or value <= 0:
+    value = float(cost) 
+    # 계산 시에는 오차 방지했으니 float 형변환해도 오차 없음. 
+    # ML lib에 넣기 위해 float 형변환
+
+    # input_token_rate, output_token_rate : rates -properties "#/$defs/decimalString"
+    # cost = fixed + input token score (토큰수*rate/기준단위) + output token score
+
+    if not math.isfinite(value) or value <= 0: # 오버플로, NaN 등 계산오류 방지.
         raise ValueError("학습 outcome의 모델 비용은 0보다 커야 합니다.")
     return value
+# 문항 id별 각 모델의 outcome 객체를 묶은 list를 outcome으로 받고, RoutingPolicy 받아서
+# 모델의 총 비용을 합산해서(cost 총 합산) float value로 return
+
 
 
 def build_training_matrix(
     inputs: InputBatch, outcomes: OutcomeBatch, policy: RoutingPolicy, hash_bins: int
 ) -> Tuple[Any, Any]:
-    outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
 
+    # (episode id, model id) : Outcome()
+    outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
     """outcomes.outcomes = [
     Outcome("ep-001", "ax31-light", score=0.7, input_tokens=50, output_tokens=120),
     Outcome("ep-001", "ax31",       score=0.9, input_tokens=50, output_tokens=95),
@@ -177,19 +193,37 @@ def build_training_matrix(
         raise ValueError("Train outcome 행렬이 입력과 모델 전체를 포함하지 않습니다.")
     # 일치하지 않는 경우를 방지. (데이터 결실, 처리 실패 등)
 
-
     matrix = np.asarray(
         [_team_raw_feature_vector(episode, hash_bins) for episode in inputs.episodes],
         dtype=np.float64,
     )
+    # _team_raw_feature_vector가 뱉은 266개 float 튜플들을 묶어서 array로 만들어 행렬화
+    # dtype == data type (float64 == 배정도 부동소수점, double precision)
+
     targets = []
     
     for episode in inputs.episodes:
         rows = [outcome_index[(episode.episode_id, m)] for m in MODEL_IDS]
+        # 문항별 각 모델의 outcome() 객체 list
+
         scores = [float(row.score) for row in rows]
+        # row에서 모델의 score list
+
         log_costs = [math.log(_outcome_cost(row, policy)) for row in rows]
-        targets.append(scores + log_costs)
-    return matrix, np.asarray(targets, dtype=np.float64)
+        # row의 모델별 log(cost) list
+        # 비용 편차가 클 때를 대비해 log 스케일링하여 안정성 높임
+
+        targets.append(scores + log_costs) # [scroes list, log_costs]
+
+        # episode 별 모델들의 결과를 수집하는 것
+        # scores: [모델A점수, 모델B점수, 모델C점수]
+        # log_costs: [모델A비용, 모델B비용, 모델C비용]
+
+    return matrix, np.asarray(targets, dtype=np.float64) # targets도 matrix화해서 배정도로 return)
+# episode 내용 임베딩해서 특성 추출한 후 matrix화하여 return 
+# 문항별 score, log(cost) 합쳐(list를 이어서.) matrix화하여 return 
+
+
 
 
 def fit_ridge(matrix, targets, alpha: float):
@@ -215,15 +249,19 @@ def predict_ridge(matrix, mean, scale, intercept, coefficients):
 
 
 def oof_predictions(matrix, targets, *, folds: int, alpha: float):
-    rows = matrix.shape[0]
-    predictions = np.empty_like(targets)
-    fold_ids = np.arange(rows) % folds
+    rows = matrix.shape[0]                # 전체 데이터(episodes) 개수. 셰잎의 [0]
+    predictions = np.empty_like(targets)  # targets의 형식 가진 빈(초기화X) 배열을 생성
+    fold_ids = np.arange(rows) % folds    # 데이터 개수만큼 array 만들기 (100이면 0~99) % 데이터 쪼개기
+
     for fold in range(folds):
-        validation = fold_ids == fold
-        training = ~validation
+        validation = fold_ids == fold   # flod_ids = ndarray
+        training = ~validation          # 
         mean, scale, intercept, coefficients = fit_ridge(matrix[training], targets[training], alpha)
         predictions[validation] = predict_ridge(matrix[validation], mean, scale, intercept, coefficients)
     return predictions
+# Out Of Fold == 모델 검증할 때 쓰는 교차검증 기법과 유사
+# OOF : 실제로 이 모델이 처음 보는 데이터를 얼마나 잘 맞추는지 평가하는 것
+# folds == 데이터를 쪼갤 단위
 
 
 def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[float], label: str) -> float:
@@ -231,15 +269,19 @@ def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[flo
     alpha for that block alone. A shared alpha across score+cost let score's
     much larger MSE dominate the objective and left the cost heads
     under-regularized."""
-    best_alpha = candidates[0]
-    best_mse = math.inf
+
+    best_alpha = candidates[0]   # 0.1~10^6 가중치 list
+    best_mse = math.inf          # 무한대의 숫자 (오차니까 무한대로 초기화)
+
     for alpha in candidates:
         predictions = oof_predictions(matrix, targets, folds=folds, alpha=alpha)
         mse = float(np.mean((predictions - targets) ** 2))
         print(f"  [{label}] alpha={alpha:>10.4g}  mse={mse:.5f}")
+
         if mse < best_mse:
             best_mse = mse
             best_alpha = alpha
+
     return best_alpha
 
 
@@ -258,20 +300,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     inputs = load_input(args.train_input)
     outcomes = load_outcomes(args.train_outcomes)
 
-    print(f"학습 문항 수: {len(inputs.episodes)}  hash_bins={args.hash_bins}")
+    # protocol의 parse_* 까지 이해할 필요는 없고,
+    # protocol에서 던져주는 Type의 꼴만 이해하면 됨. (dataclass + json형식)
 
+    print(f"학습 문항 수: {len(inputs.episodes)}  hash_bins={args.hash_bins}")
     matrix, targets = build_training_matrix(inputs, outcomes, policy, args.hash_bins)
 
     print(f"특징 행렬: {matrix.shape}  타깃: {targets.shape}")
+    # build_training_matrix  matrix(특징행렬), targets(model별 log_cost+scores)
 
-    model_count = len(MODEL_IDS)
-    score_targets = targets[:, :model_count]
-    cost_targets = targets[:, model_count:]
+    model_count = len(MODEL_IDS)                # 모델 수
+    score_targets = targets[:, :model_count]    
+    cost_targets = targets[:, model_count:]   
+
+    # scores: [모델A점수, 모델B점수, 모델C점수]
+    # log_costs: [모델A비용, 모델B비용, 모델C비용]
+
+
 
     candidates = [10.0**exponent for exponent in range(-1, 7)]
+    # 0.1~10^6 : 규제 강도 candidates
+
     print("alpha 후보 탐색 -- score와 cost를 따로 고른다 (out-of-fold, 5-fold):")
     score_alpha = select_alpha_single(matrix, score_targets, folds=5, candidates=candidates, label="score")
     cost_alpha = select_alpha_single(matrix, cost_targets, folds=5, candidates=candidates, label="cost ")
+
     print(f"선택된 alpha: score={score_alpha:g}  cost={cost_alpha:g}")
 
     score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(

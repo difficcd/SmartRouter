@@ -287,17 +287,22 @@ def _team_fnv1a64(data: bytes) -> int:
         # 마스킹 연산은 오버플로 방지용 
         
     return value
-# 해시 함수 구현
+# 해시 함수 구현 (64bit 정수 : 16*4bit  해시값 반환)
+# ref ) https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function 
 # bytes : str을 직접 계산 불가. byte data로 바꿔야 계산 가능
 # 순수한 이진 데이터(바이트 스트림) 으로 변환 : .encode() : hash_slot. 
 
 
 def _team_hash_slot(token: str, hash_bins: int) -> _TeamTuple[int, float]:
-    digest = _team_fnv1a64(token.encode("utf-8"))
+    digest = _team_fnv1a64(token.encode("utf-8")) # token => 64bit hash value
 
-    index = digest % hash_bins
-    sign = 1.0 if (digest >> 63) & 1 else -1.0
+    index = digest % hash_bins                   # 해시값을 해시칸개수로 modulo연산
+    sign = 1.0 if (digest >> 63) & 1 else -1.0   # 최상위비트값이 1이면 +1.0 0이면 -1.0
+                                                 # 충돌상쇄처리 (feature hashing) 
     return index, sign
+# 해시 함수 구현 (해시 슬롯 매핑)
+
+
 
 
 def _team_tokens(text: str) -> _TeamTuple[str, ...]:
@@ -346,6 +351,7 @@ def _team_dense_features(episode: Episode, text: str) -> _TeamTuple[float, ...]:
 
 
 # 문항 하나(Episode)를 받아서, 266개 숫자 튜플 하나로 바꿔서 뱉는 함수
+# episode text 받아서 hash에 맞게 해싱하고, 고정특징+해싱으로 임베딩해서 Tuple 반환
 def _team_raw_feature_vector(episode: Episode, hash_bins: int) -> _TeamTuple[float, ...]:
     # _TeamTuple[float, ...] )  float* (reg ex) 같은 느낌 (빈 튜플 허용, 반복 허용)
 
@@ -362,8 +368,11 @@ def _team_raw_feature_vector(episode: Episode, hash_bins: int) -> _TeamTuple[flo
     for gram in (*tokens, *_team_bigrams(tokens)):
         index, sign = _team_hash_slot(gram, hash_bins)
         vector[offset + index] += sign
+    # unigram 과 bigram 을 unpacking(*) 하여 펼쳐 꺼내고
+    # gram이란 튜플단위로 hash 함수에 넣고 해싱하는 것. (sign:bias해소)
+    # 유니그램별, 바이그램별 임베딩을 해서 합친 값을 0초기화된 칸에 넣어주는것.
 
-    return tuple(vector)
+    return tuple(vector) # read only, immutable (Tuple) 
 
 
 # ---- artifact: the trained model, frozen into one JSON blob --------------
