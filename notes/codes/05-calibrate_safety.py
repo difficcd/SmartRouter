@@ -71,10 +71,12 @@ def load_artifact(path: Path):
 
 def predict_batch(episodes, artifact):
     scores, costs = [], []
+
     for episode in episodes:
         episode_scores, episode_costs = _team_predict_episode(episode, artifact)
         scores.append(episode_scores)
         costs.append(episode_costs)
+        
     return scores, costs
 
 
@@ -107,6 +109,7 @@ def build_matrices(
     pred_costs = np.empty((n, 3), dtype=np.float64)
     real_scores = np.empty((n, 3), dtype=np.float64)
     real_costs = np.empty((n, 3), dtype=np.float64)
+
     for row, episode in enumerate(inputs.episodes):
         for col, model_id in enumerate(MODEL_IDS):
             pred_scores[row, col] = predicted_scores[row][model_id]
@@ -243,6 +246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dev-outcomes", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    # dev data로 tier_safety_ratios, risk_multiplier 채워넣는 코드
+    # tier_safety_ratios
 
     policy = load_bundled_policy()
     artifact = load_artifact(args.artifact)

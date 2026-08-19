@@ -199,6 +199,7 @@ def build_training_matrix(
     )
     # _team_raw_feature_vector가 뱉은 266개 float 튜플들을 묶어서 array로 만들어 행렬화
     # dtype == data type (float64 == 배정도 부동소수점, double precision)
+    # matrix.shape : (1760, 266) == (episode 개수, feature 개수(hash+fixed))
 
     targets = []
     
@@ -225,43 +226,91 @@ def build_training_matrix(
 
 
 
-
 def fit_ridge(matrix, targets, alpha: float):
-    mean = matrix.mean(axis=0)
-    scale = matrix.std(axis=0)
-    scale = np.where(scale > 1e-12, scale, 1.0)
-    standardized = (matrix - mean) / scale
+
+    # aixs=0:row기준으로, row방향 따라 게산 : matrix[0] == 결과 개수
+
+    mean = matrix.mean(axis=0)                      # all episode 임베딩값의 mean
+    scale = matrix.std(axis=0)                      # all episode 임베딩값의 표준편차
+    scale = np.where(scale > 1e-12, scale, 1.0)     
+    # 1e-12(0근사 미세한값)<=std인 경우 std=1로 처리.  : 0으로 나누기 오류 방지 
+    # 같은 특징끼리만(n번째 특징끼리) 1,760개별 평균 도출 (shape: (feature_cnt,))
+
+    standardized = (matrix - mean) / scale       
+    # 알파 가중치별 ridge 회귀 정답값 분포를 보고 싶은건데,
+    # 데이터 노이즈 때문에 결과에 영향을 미치면 안 되므로
+    # ridge 핵심인 alpha영향력을 보기 위한 과정, 배치 정규화와 유사함
+
     intercept = targets.mean(axis=0)
     centered = targets - intercept
+    # targets는 정규화 대신 중앙화(centering)
+    # 절편을 계산에서 분리하기 위한 편의상 조건
+    # 원점이 데이터의 mean에 위치해있어야 더 깔끔하고 오차 줄여줌. + bias, 노이즈 빼기
 
     rows, columns = standardized.shape
-    if rows <= columns:
+
+    if rows <= columns: # 연산 최적화 (행렬곱 최적화) : 샘플 수 <= 특성 수 
+
         system = standardized @ standardized.T + alpha * np.eye(rows)
         coefficients = standardized.T @ np.linalg.solve(system, centered)
+        # linalg == linear algebra module(numpy), solve(A, b) == Ax=b 해 반환.
+        # system*x = centered 의 x를 구함.
+        # coefficients == 희귀계수 (matrix*alpha* "x" = targets)
+
     else:
         system = standardized.T @ standardized + alpha * np.eye(columns)
         coefficients = np.linalg.solve(system, standardized.T @ centered)
+
+    # @ == 행렬곱 연산자. np.dot(A, B) == A @ B
+    # matrix : ndarray.T ==  Transpose 행렬
+
     return mean, scale, intercept, coefficients
+# 각 알파값별로 데이터를 임의로 뽑아 테스트하는 oof helper
+#    알파값별로 가중치를 알아내서, 규제강도(alpha) 조절했을 때 가중치(coeff=x) 변화량 return
+# train data의 matrix(특징행렬), targets(score+cost) 받아서 알파값(가중치) 적용
+
+# return : mean(matrix episode임베딩값의 mean),  scale(std),
+#          intercept(targets mean, 절편), coeff(x=weight)
+
 
 
 def predict_ridge(matrix, mean, scale, intercept, coefficients):
     return (matrix - mean) / scale @ coefficients + intercept
+# 훈련때 구해둔 mean, std, intercept, coeff 그대로 가져와서 test용에다 넣음
+# 검증용 데이터 정규화한 다음 가중치 곱하고 intercept(빼뒀던 mean) 더해서 최종 예측점수 return 
+
 
 
 def oof_predictions(matrix, targets, *, folds: int, alpha: float):
+    # folds == 데이터를 쪼갤 단위
+    # k겹 교차검증 (k fold cross-validation). 인공지능_1 17p 참조
+
+
     rows = matrix.shape[0]                # 전체 데이터(episodes) 개수. 셰잎의 [0]
     predictions = np.empty_like(targets)  # targets의 형식 가진 빈(초기화X) 배열을 생성
-    fold_ids = np.arange(rows) % folds    # 데이터 개수만큼 array 만들기 (100이면 0~99) % 데이터 쪼개기
+    fold_ids = np.arange(rows) % folds    # 데이터 개수 ndarray (100이면 0~99) % 데이터 쪼개기
 
     for fold in range(folds):
-        validation = fold_ids == fold   # flod_ids = ndarray
-        training = ~validation          # 
+        validation = fold_ids == fold   # 현 시점에서의 test data (임의)
+        training = ~validation          # 현 시점에서의 train data 
+
         mean, scale, intercept, coefficients = fit_ridge(matrix[training], targets[training], alpha)
+        # matrix[training] == Boolean indexing. training은 Boolean ndarray (data개수만큼 존재)
+        # ndarray[*] 는, *라는 Boolean ndarray 에 따라 ndarray 원본값 중 true인 위치에서만 뽑아라.
+        # 결국 여기서의 mean, scale .. coeff = alpha값 적용한 weight의 변화를 알아보기 위한 변수들.
+
         predictions[validation] = predict_ridge(matrix[validation], mean, scale, intercept, coefficients)
+        # 현재 test (validation용) 데이터들에 대한 예측값 뽑아내기
+
     return predictions
 # Out Of Fold == 모델 검증할 때 쓰는 교차검증 기법과 유사
 # OOF : 실제로 이 모델이 처음 보는 데이터를 얼마나 잘 맞추는지 평가하는 것
-# folds == 데이터를 쪼갤 단위
+# 현재 받아온 알파값이 학습에서의 가중치에 얼마나 영향을 주는지를 알기 위해 
+# 임의의 train, test데이터 만들고 학습시킨 다음 test데이터에 대한 결과값을 return
+
+# 이 모델이 특정 알파값에서 얼마나 똑똑한지, 혹은 얼마나 과적합(Overfitting)되지 않는지를 
+# 수치로 확인하기 위해 전 데이터를 한 번씩 다 시험해 보는 과정
+
 
 
 def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[float], label: str) -> float:
@@ -269,12 +318,15 @@ def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[flo
     alpha for that block alone. A shared alpha across score+cost let score's
     much larger MSE dominate the objective and left the cost heads
     under-regularized."""
+    # score / log_cost 분리해서 순회하는 이유 ref.
 
     best_alpha = candidates[0]   # 0.1~10^6 가중치 list
     best_mse = math.inf          # 무한대의 숫자 (오차니까 무한대로 초기화)
 
-    for alpha in candidates:
+    for alpha in candidates:     
         predictions = oof_predictions(matrix, targets, folds=folds, alpha=alpha)
+        # 현재 알파값에 대해 oof predict 수행
+
         mse = float(np.mean((predictions - targets) ** 2))
         print(f"  [{label}] alpha={alpha:>10.4g}  mse={mse:.5f}")
 
@@ -283,6 +335,11 @@ def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[flo
             best_alpha = alpha
 
     return best_alpha
+# oof predict 에서의 predict와 targets 비교:
+# MSE가 가장 작은 alpha값이 beat_alpha값으로 선택, return
+
+
+
 
 
 # ==== main ==== # 
@@ -324,8 +381,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("alpha 후보 탐색 -- score와 cost를 따로 고른다 (out-of-fold, 5-fold):")
     score_alpha = select_alpha_single(matrix, score_targets, folds=5, candidates=candidates, label="score")
     cost_alpha = select_alpha_single(matrix, cost_targets, folds=5, candidates=candidates, label="cost ")
+    # 숫자의 분포/범위가 다르며, 특성이 다르기 때문에 따로 처리해야 함 (합쳐서 보면 cost가 압도적)
 
     print(f"선택된 alpha: score={score_alpha:g}  cost={cost_alpha:g}")
+
+
 
     score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(
         matrix, score_targets, score_alpha
@@ -335,10 +395,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     assert np.allclose(score_mean, cost_mean) and np.allclose(score_scale, cost_scale)
     mean, scale = score_mean, score_scale
+    # assert == 반드시 참인 조건을 확인함 (False 이면 프로그램 죽임)
+    # allclose() == 두 개의 배열이 소수점 오차 범위 내에서 거의 비슷한가?를 비교해 bool return
+    # 입력 데이터가 완전히 동일한지 교차 검증하는 것. (전처리 무결성 보장)
+    # matrix라는 동일 행렬로부터 나온 mean, std이므로, 동일해야만 함.
+    # mean, scale은 matrix 총 기준이고, intercept/coeffi만 다름
 
     def head_dict(intercept: float, coefficients) -> dict:
         return {"intercept": float(intercept), "coefficients": [float(c) for c in coefficients]}
+    # "score_heads": { "ax31": { "coefficients": [], "intercept": }, "ax31-light": {}, "axk1-think": {} }
 
+    # artifact.json 구성 (tier_safety_ratios, risk_multiplier 두가지는 임시값)
+    # training/artifact.json 구조 참조.
     artifact = {
         "artifact_type": "team-router-v1",
         "schema_version": 1,
@@ -349,8 +417,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "model_ids": list(MODEL_IDS),
         "policy_id": policy.policy_id,
         "policy_sha256": policy_sha256(policy),
+        # 모델 정책이 "단 하나라도 수정되었는지(무결성 검증)"를 판별
+
         "feature_mean": [float(v) for v in mean],
         "feature_scale": [float(v) for v in scale],
+
         "score_heads": {
             model_id: head_dict(score_intercept[i], score_coefficients[:, i])
             for i, model_id in enumerate(MODEL_IDS)
@@ -359,18 +430,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_id: head_dict(cost_intercept[i], cost_coefficients[:, i])
             for i, model_id in enumerate(MODEL_IDS)
         },
+        # enumerate 의 i값은 intercept, coeffic 뽑아내기 위해서만 사용
+
         "tier_safety_ratios": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
         "risk_multiplier": {model_id: 1.0 for model_id in MODEL_IDS},  # placeholder
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    # out 파일경로 parent 를 대상으로 mkdir (sibling) : --out args
+    # parents=True: 중간에 폴더가 없으면 부모 폴더들까지 만들어 줌
+    # exist_ok=True: 파일이 이미 존재해도 덮어쓰기
+
     args.out.write_text(
         json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
-    )
+    ) 
+    # artifact 를 json 문자열로 변경, 유니코드 ASCII로 저장하지 않고 원래 글자 그대로 출력(False)
+    # indent=2 들여쓰기 2칸, 가독성을 위한 것.   sort_keys : 딕셔너리 키들을 알파벳순 정렬
+    # SHA-256 해시를 일관되게 만들기 위한 필수 조건. 
+
     print(f"OK: {args.out}에 학습 파일을 저장했습니다.")
+
     print("주의: tier_safety_ratios/risk_multiplier는 아직 자리표시자(1.0)입니다.")
     print("      training/calibrate_safety.py -> training/bake_artifact.py 순으로 이어서 실행할 것.")
+
     return 0
 
 
