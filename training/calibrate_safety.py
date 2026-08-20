@@ -102,10 +102,11 @@ def build_matrices(
     outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
 
     n = len(inputs.episodes)
-    pred_scores = np.empty((n, 3), dtype=np.float64)
-    pred_costs = np.empty((n, 3), dtype=np.float64)
-    real_scores = np.empty((n, 3), dtype=np.float64)
-    real_costs = np.empty((n, 3), dtype=np.float64)
+    n_models = len(MODEL_IDS)
+    pred_scores = np.empty((n, n_models), dtype=np.float64)
+    pred_costs = np.empty((n, n_models), dtype=np.float64)
+    real_scores = np.empty((n, n_models), dtype=np.float64)
+    real_costs = np.empty((n, n_models), dtype=np.float64)
     for row, episode in enumerate(inputs.episodes):
         for col, model_id in enumerate(MODEL_IDS):
             pred_scores[row, col] = predicted_scores[row][model_id]
