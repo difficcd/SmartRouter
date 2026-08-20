@@ -88,8 +88,12 @@ SAFETY_GRID = [
     # a finer step there instead of jumping straight to 0.90/1.00.
     0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00,
 ]
-RISK_HIGH_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
-RISK_MID_GRID = [1.0, 1.2, 1.5, 2.0]
+# v3's per-tier search picked risk_mid=2.0 for balanced (the grid's old max)
+# and risk_high=3.0-4.0 for premium in more than one run -- both edges of the
+# old ranges, meaning the true optimum may lie outside what was searchable.
+# Extended both upward to check.
+RISK_HIGH_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0]
+RISK_MID_GRID = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
 # Hard backstop on axk1-think's share of the tier cap (see allocate_vectorized's
 # docstring) -- searched separately, after (risk_mid, risk_high, safety_ratio) are
 # already fixed, since it's a much smaller correction on top of those.
