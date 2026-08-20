@@ -215,7 +215,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_id: float(cost_smear[i]) for i, model_id in enumerate(MODEL_IDS)
         },
         "tier_safety_ratios": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
-        "risk_multiplier": {model_id: 1.0 for model_id in MODEL_IDS},  # placeholder
+        # placeholder -- per-tier now, since fast/premium want opposite values
+        "risk_multiplier": {
+            tier: {model_id: 1.0 for model_id in MODEL_IDS} for tier in TIERS
+        },
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

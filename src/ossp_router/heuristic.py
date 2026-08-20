@@ -1747,9 +1747,21 @@ _TEAM_ARTIFACT_JSON = r'''
   "policy_id": "ossp-2026-prompt-router-v1",
   "policy_sha256": "7c892c423da5fa762e7e1a93b9fa071be51e259b65d2b63a5ba434c4342d7a8e",
   "risk_multiplier": {
-    "ax31": 2.0,
-    "ax31-light": 1.0,
-    "axk1-think": 2.5
+    "balanced": {
+      "ax31": 2.0,
+      "ax31-light": 1.0,
+      "axk1-think": 2.0
+    },
+    "fast": {
+      "ax31": 1.5,
+      "ax31-light": 1.0,
+      "axk1-think": 2.0
+    },
+    "premium": {
+      "ax31": 1.0,
+      "ax31-light": 1.0,
+      "axk1-think": 3.0
+    }
   },
   "schema_version": 1,
   "score_heads": {
@@ -2569,7 +2581,7 @@ _TEAM_ARTIFACT_JSON = r'''
   },
   "tier_safety_ratios": {
     "balanced": 0.8,
-    "fast": 0.5,
+    "fast": 0.82,
     "premium": 0.7
   }
 }
@@ -2596,7 +2608,10 @@ def _team_parse_artifact(text: str) -> _TeamArtifact:
         log_cost_heads={m: head(value["log_cost_heads"][m]) for m in _TEAM_MODEL_IDS},
         cost_smear={m: float(value["cost_smear"][m]) for m in _TEAM_MODEL_IDS},
         tier_safety_ratios={t: float(value["tier_safety_ratios"][t]) for t in TIERS},
-        risk_multiplier={m: float(value["risk_multiplier"][m]) for m in _TEAM_MODEL_IDS},
+        risk_multiplier={
+            t: {m: float(value["risk_multiplier"][t][m]) for m in _TEAM_MODEL_IDS}
+            for t in TIERS
+        },
     )
 
 
@@ -2721,7 +2736,7 @@ def team_router_make_submission(
         predicted_costs,
         budget_multiplier=float(policy.tiers[tier].budget_multiplier),
         safety_ratio=artifact.tier_safety_ratios[tier],
-        risk_multiplier=artifact.risk_multiplier,
+        risk_multiplier=artifact.risk_multiplier[tier],
     )
 
     submission = Submission(

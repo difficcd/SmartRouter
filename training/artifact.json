@@ -1379,9 +1379,21 @@
   "policy_id": "ossp-2026-prompt-router-v1",
   "policy_sha256": "7c892c423da5fa762e7e1a93b9fa071be51e259b65d2b63a5ba434c4342d7a8e",
   "risk_multiplier": {
-    "ax31": 2.0,
-    "ax31-light": 1.0,
-    "axk1-think": 2.5
+    "balanced": {
+      "ax31": 2.0,
+      "ax31-light": 1.0,
+      "axk1-think": 2.0
+    },
+    "fast": {
+      "ax31": 1.5,
+      "ax31-light": 1.0,
+      "axk1-think": 2.0
+    },
+    "premium": {
+      "ax31": 1.0,
+      "ax31-light": 1.0,
+      "axk1-think": 3.0
+    }
   },
   "schema_version": 1,
   "score_heads": {
@@ -2201,7 +2213,7 @@
   },
   "tier_safety_ratios": {
     "balanced": 0.8,
-    "fast": 0.5,
+    "fast": 0.82,
     "premium": 0.7
   }
 }
