@@ -80,8 +80,20 @@ def predict_batch(episodes, artifact):
 RNG_SEED = 20260815
 BOOTSTRAP_K = 300
 OVERRUN_TARGET = 0.01
-SAFETY_GRID = [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+SAFETY_GRID = [
+    0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80,
+    # budget_multiplier * safety_ratio < 1.0 always collapses to all-light
+    # (max(1.0, ...) floor in allocate_vectorized's cap), so 0.80-1.00 is
+    # the only region where a tier can actually promote anything -- worth
+    # a finer step there instead of jumping straight to 0.90/1.00.
+    0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00,
+]
 RISK_HIGH_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+RISK_MID_GRID = [1.0, 1.2, 1.5, 2.0]
+# Hard backstop on axk1-think's share of the tier cap (see allocate_vectorized's
+# docstring) -- searched separately, after (risk_mid, risk_high, safety_ratio) are
+# already fixed, since it's a much smaller correction on top of those.
+HIGH_CAP_GRID = [1.0, 0.90, 0.80, 0.70, 0.60, 0.50]
 
 
 def _real_cost(outcome, policy: RoutingPolicy) -> float:
@@ -124,36 +136,49 @@ def allocate_vectorized(
     budget_multiplier: float,
     safety_ratio: float,
     risk_multiplier: np.ndarray,
+    high_cap_ratio: float = 1.0,
     bisection_iterations: int = 60,
 ) -> np.ndarray:
     """Same rule as team_router.allocate.select_models, vectorized. Returns
-    a (n,) int array of chosen column indices (0=light,1=ax31,2=axk1)."""
+    a (n,) int array of chosen column indices (0=light,1=ax31,2=axk1).
+
+    high_cap_ratio: hard ceiling on axk1-think's share of the tier cap,
+    independent of predicted cost accuracy -- risk_multiplier only
+    discourages axk1-think in proportion to how much we trust its cost
+    prediction, which does nothing if that prediction is simply wrong
+    (the exact hash_regex failure). 1.0 = no-op (identical to not having
+    this constraint at all, since high_total <= total <= cap already)."""
 
     light_total = pred_costs[:, 0].sum()
     cap = light_total * max(1.0, budget_multiplier * safety_ratio)
+    high_cap = cap * high_cap_ratio
 
-    def choose(penalty: float) -> Tuple[np.ndarray, float]:
+    def choose(penalty: float) -> Tuple[np.ndarray, float, float]:
         ev = pred_scores - penalty * risk_multiplier[None, :] * pred_costs / light_total
         choice = np.argmax(ev, axis=1)  # ties -> first (cheapest) column, matches -index tie-break
         total = pred_costs[np.arange(len(choice)), choice].sum()
-        return choice, total
+        high_total = pred_costs[choice == 2, 2].sum()
+        return choice, total, high_total
 
-    choice, total = choose(0.0)
-    if total > cap:
+    def violates(total: float, high_total: float) -> bool:
+        return total > cap or high_total > high_cap
+
+    choice, total, high_total = choose(0.0)
+    if violates(total, high_total):
         low, high = 0.0, 1.0
-        choice, total = choose(high)
-        while total > cap and high < 2.0**40:
+        choice, total, high_total = choose(high)
+        while violates(total, high_total) and high < 2.0**40:
             low, high = high, high * 2.0
-            choice, total = choose(high)
+            choice, total, high_total = choose(high)
         for _ in range(bisection_iterations):
             middle = (low + high) / 2.0
-            candidate_choice, candidate_total = choose(middle)
-            if candidate_total <= cap:
+            candidate_choice, candidate_total, candidate_high_total = choose(middle)
+            if not violates(candidate_total, candidate_high_total):
                 high = middle
-                choice, total = candidate_choice, candidate_total
+                choice, total, high_total = candidate_choice, candidate_total, candidate_high_total
             else:
                 low = middle
-    if total > cap:
+    if violates(total, high_total):
         choice = np.zeros(len(pred_scores), dtype=int)
 
     return choice
@@ -168,6 +193,7 @@ def bootstrap_evaluate(
     budget_multiplier: float,
     safety_ratio: float,
     risk_multiplier: np.ndarray,
+    high_cap_ratio: float = 1.0,
     rng: np.random.Generator,
     k: int = BOOTSTRAP_K,
 ) -> Tuple[float, float]:
@@ -184,6 +210,7 @@ def bootstrap_evaluate(
             budget_multiplier=budget_multiplier,
             safety_ratio=safety_ratio,
             risk_multiplier=risk_multiplier,
+            high_cap_ratio=high_cap_ratio,
         )
         real_light_total = real_costs[index, 0].sum()
         # gather realized cost/score for the chosen column, per resampled row
@@ -206,13 +233,14 @@ def calibrate_tier(
     *,
     tier: str,
     budget_multiplier: float,
+    risk_mid: float,
     risk_high: float,
     rng: np.random.Generator,
 ) -> Tuple[float, float, float]:
     """Returns (best_safety_ratio, overrun_probability, mean_score) for one
-    (tier, risk_high) pair, searching the safety grid."""
+    (tier, risk_mid, risk_high) triple, searching the safety grid."""
 
-    risk_multiplier = np.array([1.0, 1.0, risk_high])
+    risk_multiplier = np.array([1.0, risk_mid, risk_high])
     best = None  # (mean_score, safety_ratio, overrun)
     fallback = None  # lowest-overrun candidate, in case nothing meets the target
     for safety_ratio in SAFETY_GRID:
@@ -256,54 +284,87 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     rng = np.random.default_rng(RNG_SEED)
-    weights = {"fast": 0.4, "balanced": 0.3, "premium": 0.3}
     budget_multipliers = {tier: float(policy.tiers[tier].budget_multiplier) for tier in TIERS}
 
-    print(f"\n부트스트랩 K={BOOTSTRAP_K}, 목표 초과율 <= {OVERRUN_TARGET:.0%}\n")
-    best_overall = None  # (weighted_score, risk_high, {tier: (safety, overrun, score)})
-    for risk_high in RISK_HIGH_GRID:
-        per_tier = {}
-        weighted_score = 0.0
-        for tier in TIERS:
-            safety_ratio, overrun_prob, mean_score = calibrate_tier(
+    # risk_multiplier used to be shared across all three tiers (one risk_mid,
+    # risk_high picked to maximize the tiers' WEIGHTED score together). Real
+    # Dev self-check showed fast and premium want opposite risk_high values
+    # (fast: trust axk1's now-corrected cost estimate fully so it isn't
+    # priced out of its already-razor-thin 1.25x budget; premium: stay
+    # cautious on axk1's cost since it has the most room to absorb a miss)
+    # -- a shared value forces a compromise that helps neither. Each tier
+    # now searches its own (risk_mid, risk_high, safety_ratio) independently
+    # and keeps whichever wins for itself; risk_multiplier is per-tier below.
+    print(f"\n부트스트랩 K={BOOTSTRAP_K}, 목표 초과율 <= {OVERRUN_TARGET:.0%}  (등급별 독립 탐색)\n")
+    per_tier = {}  # tier -> (risk_mid, risk_high, safety_ratio, overrun, score)
+    for tier in TIERS:
+        best = None
+        for risk_high in RISK_HIGH_GRID:
+            for risk_mid in RISK_MID_GRID:
+                safety_ratio, overrun_prob, mean_score = calibrate_tier(
+                    pred_scores,
+                    pred_costs,
+                    real_scores,
+                    real_costs,
+                    tier=tier,
+                    budget_multiplier=budget_multipliers[tier],
+                    risk_mid=risk_mid,
+                    risk_high=risk_high,
+                    rng=rng,
+                )
+                if best is None or mean_score > best[4]:
+                    best = (risk_mid, risk_high, safety_ratio, overrun_prob, mean_score)
+        per_tier[tier] = best
+        risk_mid, risk_high, safety_ratio, overrun_prob, mean_score = best
+        print(
+            f"{tier:9} risk[ax31]={risk_mid:.2f} risk[axk1-think]={risk_high:.2f} "
+            f"safety={safety_ratio:.2f}  초과율={overrun_prob:.3f}  점수={mean_score:.4f}"
+        )
+
+    # Supplementary search: with (risk_mid, risk_high, safety_ratio) already fixed
+    # above, find the TIGHTEST hard cap on axk1-think's share of the tier budget
+    # that doesn't cost more than a small tolerance in bootstrap score. This is a
+    # backstop independent of cost-prediction accuracy (see allocate_vectorized's
+    # docstring) -- 1.0 is a no-op, so this can only ever help, never hurt, if the
+    # search below finds nothing better than 1.0.
+    per_tier_high_cap = {}
+    SCORE_TOLERANCE = 0.001
+    for tier in TIERS:
+        risk_mid, risk_high, safety_ratio, _overrun, baseline_score = per_tier[tier]
+        risk_multiplier = np.array([1.0, risk_mid, risk_high])
+        chosen = 1.0
+        for high_cap_ratio in sorted(HIGH_CAP_GRID):
+            overrun_prob, mean_score = bootstrap_evaluate(
                 pred_scores,
                 pred_costs,
                 real_scores,
                 real_costs,
-                tier=tier,
                 budget_multiplier=budget_multipliers[tier],
-                risk_high=risk_high,
+                safety_ratio=safety_ratio,
+                risk_multiplier=risk_multiplier,
+                high_cap_ratio=high_cap_ratio,
                 rng=rng,
             )
-            per_tier[tier] = (safety_ratio, overrun_prob, mean_score)
-            weighted_score += weights[tier] * mean_score
-        print(
-            f"risk[axk1-think]={risk_high:>4.2f}  가중점수={weighted_score:.6f}  "
-            + "  ".join(
-                f"{tier}: safety={per_tier[tier][0]:.2f} 초과율={per_tier[tier][1]:.3f} "
-                f"점수={per_tier[tier][2]:.4f}"
-                for tier in TIERS
-            )
-        )
-        if best_overall is None or weighted_score > best_overall[0]:
-            best_overall = (weighted_score, risk_high, per_tier)
-
-    weighted_score, risk_high, per_tier = best_overall
-    print(f"\n선택: risk[axk1-think]={risk_high}  가중점수(부트스트랩 평균)={weighted_score:.6f}")
-    for tier in TIERS:
-        safety_ratio, overrun_prob, mean_score = per_tier[tier]
-        print(f"  {tier:9} safety_ratio={safety_ratio:.2f}  초과율={overrun_prob:.3f}  점수={mean_score:.4f}")
+            if overrun_prob <= OVERRUN_TARGET and mean_score >= baseline_score - SCORE_TOLERANCE:
+                chosen = high_cap_ratio
+                break
+        per_tier_high_cap[tier] = chosen
+        print(f"{tier:9} high_cap_ratio={chosen:.2f}  (1.0=제약 없음, 작을수록 더 엄격)")
 
     # Read the raw JSON (not the parsed dataclass -- _team_parse_artifact drops
     # dense_feature_names since inference doesn't need it) and only touch the
     # two fields this script is responsible for, so nothing else is lost.
     artifact_dict = json.loads(args.artifact.read_text(encoding="utf-8"))
-    artifact_dict["tier_safety_ratios"] = {tier: per_tier[tier][0] for tier in TIERS}
+    artifact_dict["tier_safety_ratios"] = {tier: per_tier[tier][2] for tier in TIERS}
     artifact_dict["risk_multiplier"] = {
-        MODEL_IDS[0]: 1.0,
-        MODEL_IDS[1]: 1.0,
-        MODEL_IDS[2]: risk_high,
+        tier: {
+            MODEL_IDS[0]: 1.0,
+            MODEL_IDS[1]: per_tier[tier][0],
+            MODEL_IDS[2]: per_tier[tier][1],
+        }
+        for tier in TIERS
     }
+    artifact_dict["high_cap_ratio"] = per_tier_high_cap
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
         json.dumps(artifact_dict, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
