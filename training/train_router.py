@@ -35,6 +35,8 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+BAGGING_ROUNDS = 30
+
 from ossp_router.heuristic import (  # noqa: E402
     _TEAM_DENSE_FEATURE_NAMES,
     _team_raw_feature_vector,
@@ -91,11 +93,11 @@ def build_training_matrix(
     return matrix, np.asarray(targets, dtype=np.float64)
 
 
-def fit_ridge(matrix, targets, alpha: float):
-    mean = matrix.mean(axis=0)
-    scale = matrix.std(axis=0)
-    scale = np.where(scale > 1e-12, scale, 1.0)
-    standardized = (matrix - mean) / scale
+def _ridge_solve(standardized, targets, alpha: float):
+    """Assumes `standardized` is already (X-mean)/scale. Split out of fit_ridge
+    so bagging can reuse ONE fixed standardization across bootstrap resamples
+    of the rows (see bag_ridge) instead of each resample computing its own
+    mean/scale, which would make the resulting coefficients incomparable."""
     intercept = targets.mean(axis=0)
     centered = targets - intercept
 
@@ -106,7 +108,43 @@ def fit_ridge(matrix, targets, alpha: float):
     else:
         system = standardized.T @ standardized + alpha * np.eye(columns)
         coefficients = np.linalg.solve(system, standardized.T @ centered)
+    return intercept, coefficients
+
+
+def fit_ridge(matrix, targets, alpha: float):
+    mean = matrix.mean(axis=0)
+    scale = matrix.std(axis=0)
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    standardized = (matrix - mean) / scale
+    intercept, coefficients = _ridge_solve(standardized, targets, alpha)
     return mean, scale, intercept, coefficients
+
+
+def bag_ridge(matrix, targets, alpha: float, *, rounds: int, rng: np.random.Generator):
+    """Bootstrap-aggregate ridge: refit on `rounds` bootstrap resamples of the
+    rows (with replacement) and average the coefficients. Because the model is
+    linear, averaging B sets of coefficients is exactly equivalent to averaging
+    B models' predictions (mean(w_b @ x) == mean(w_b) @ x) -- so this adds zero
+    runtime cost to the shipped predictor, only to this offline fit. Uses ONE
+    fixed mean/scale from the full (non-resampled) data so every resample's
+    coefficients are in the same units and can be validly averaged."""
+    mean = matrix.mean(axis=0)
+    scale = matrix.std(axis=0)
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    standardized = (matrix - mean) / scale
+
+    rows = matrix.shape[0]
+    intercept_sum = None
+    coefficients_sum = None
+    for _ in range(rounds):
+        index = rng.integers(0, rows, size=rows)
+        intercept, coefficients = _ridge_solve(standardized[index], targets[index], alpha)
+        if intercept_sum is None:
+            intercept_sum, coefficients_sum = intercept, coefficients
+        else:
+            intercept_sum = intercept_sum + intercept
+            coefficients_sum = coefficients_sum + coefficients
+    return mean, scale, intercept_sum / rounds, coefficients_sum / rounds
 
 
 def predict_ridge(matrix, mean, scale, intercept, coefficients):
@@ -179,11 +217,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_smear))
     )
 
-    score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(
-        matrix, score_targets, score_alpha
+    # Bagging: refit on BAGGING_ROUNDS bootstrap resamples of the 1,760 rows and
+    # average the coefficients (exactly equivalent to averaging predictions,
+    # since the model is linear -- see bag_ridge's docstring). Aimed at the
+    # tail-error problem that's been driving the fast-tier safety margin: a
+    # single ridge fit can happen to be thrown off by whichever rows landed in
+    # it, bagging smooths that out. Zero added cost at inference time.
+    bag_rng = np.random.default_rng(20260820)
+    score_mean, score_scale, score_intercept, score_coefficients = bag_ridge(
+        matrix, score_targets, score_alpha, rounds=BAGGING_ROUNDS, rng=bag_rng
     )
-    cost_mean, cost_scale, cost_intercept, cost_coefficients = fit_ridge(
-        matrix, cost_targets, cost_alpha
+    cost_mean, cost_scale, cost_intercept, cost_coefficients = bag_ridge(
+        matrix, cost_targets, cost_alpha, rounds=BAGGING_ROUNDS, rng=bag_rng
     )
     assert np.allclose(score_mean, cost_mean) and np.allclose(score_scale, cost_scale)
     mean, scale = score_mean, score_scale
