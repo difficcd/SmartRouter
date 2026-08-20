@@ -356,6 +356,7 @@ class _TeamArtifact:
         "cost_smear",
         "tier_safety_ratios",
         "risk_multiplier",
+        "high_cap_ratio",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -924,6 +925,11 @@ _TEAM_ARTIFACT_JSON = r'''
   "feature_version": "team-features-v1",
   "hash_algorithm": "fnv1a64-signed-word-1-2",
   "hash_bins": 256,
+  "high_cap_ratio": {
+    "balanced": 1.0,
+    "fast": 1.0,
+    "premium": 0.7
+  },
   "log_cost_heads": {
     "ax31": {
       "coefficients": [
@@ -2612,6 +2618,7 @@ def _team_parse_artifact(text: str) -> _TeamArtifact:
             t: {m: float(value["risk_multiplier"][t][m]) for m in _TEAM_MODEL_IDS}
             for t in TIERS
         },
+        high_cap_ratio={t: float(value["high_cap_ratio"][t]) for t in TIERS},
     )
 
 
@@ -2666,11 +2673,21 @@ def _team_select_models(
     budget_multiplier: float,
     safety_ratio: float,
     risk_multiplier: _TeamMapping[str, float],
+    high_cap_ratio: float = 1.0,
 ) -> _TeamTuple[str, ...]:
     light_total = _team_math.fsum(row[_TEAM_MODEL_IDS[0]] for row in predicted_costs)
     cap = light_total * max(1.0, budget_multiplier * safety_ratio)
+    # risk_multiplier only discourages the most expensive model in proportion to
+    # how much we (think we) trust its cost prediction -- if that prediction is
+    # simply wrong (the exact hash_regex failure mode), no amount of discouraging
+    # helps, because the premise it's reasoning from is broken. high_cap_ratio is
+    # a hard backstop independent of prediction accuracy: no matter what the EV
+    # comparison says, the most expensive model can never claim more than this
+    # fraction of the tier's cap.
+    high_model = _TEAM_MODEL_IDS[-1]
+    high_cap = cap * high_cap_ratio
 
-    def choose(penalty: float) -> _TeamTuple[_TeamTuple[str, ...], float]:
+    def choose(penalty: float) -> _TeamTuple[_TeamTuple[str, ...], float, float]:
         selected = []
         for scores, costs in zip(predicted_scores, predicted_costs):
             model_id = max(
@@ -2685,24 +2702,32 @@ def _team_select_models(
         total = _team_math.fsum(
             costs[model_id] for costs, model_id in zip(predicted_costs, selected)
         )
-        return tuple(selected), total
+        high_total = _team_math.fsum(
+            costs[model_id]
+            for costs, model_id in zip(predicted_costs, selected)
+            if model_id == high_model
+        )
+        return tuple(selected), total, high_total
 
-    selected, total = choose(0.0)
-    if total > cap:
+    def violates(total: float, high_total: float) -> bool:
+        return total > cap or high_total > high_cap
+
+    selected, total, high_total = choose(0.0)
+    if violates(total, high_total):
         low, high = 0.0, 1.0
-        selected, total = choose(high)
-        while total > cap and high < 2.0**40:
+        selected, total, high_total = choose(high)
+        while violates(total, high_total) and high < 2.0**40:
             low, high = high, high * 2.0
-            selected, total = choose(high)
+            selected, total, high_total = choose(high)
         for _iteration in range(40):
             middle = (low + high) / 2.0
-            candidate_selected, candidate_total = choose(middle)
-            if candidate_total <= cap:
+            candidate_selected, candidate_total, candidate_high_total = choose(middle)
+            if not violates(candidate_total, candidate_high_total):
                 high = middle
-                selected, total = candidate_selected, candidate_total
+                selected, total, high_total = candidate_selected, candidate_total, candidate_high_total
             else:
                 low = middle
-    if total > cap:
+    if violates(total, high_total):
         selected = tuple(_TEAM_MODEL_IDS[0] for _row in predicted_scores)
 
     return selected
@@ -2737,6 +2762,7 @@ def team_router_make_submission(
         budget_multiplier=float(policy.tiers[tier].budget_multiplier),
         safety_ratio=artifact.tier_safety_ratios[tier],
         risk_multiplier=artifact.risk_multiplier[tier],
+        high_cap_ratio=artifact.high_cap_ratio[tier],
     )
 
     submission = Submission(

@@ -556,6 +556,11 @@
   "feature_version": "team-features-v1",
   "hash_algorithm": "fnv1a64-signed-word-1-2",
   "hash_bins": 256,
+  "high_cap_ratio": {
+    "balanced": 1.0,
+    "fast": 1.0,
+    "premium": 0.7
+  },
   "log_cost_heads": {
     "ax31": {
       "coefficients": [
