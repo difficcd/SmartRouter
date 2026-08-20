@@ -168,6 +168,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     cost_alpha = select_alpha_single(matrix, cost_targets, folds=5, candidates=candidates, label="cost ")
     print(f"선택된 alpha: score={score_alpha:g}  cost={cost_alpha:g}")
 
+    # exp()로 log-cost를 원래 스케일로 되돌리면 Jensen 부등식 때문에 구조적으로
+    # 과소추정된다(E[exp(residual)] > exp(E[residual]) = 1, residual이 정확히
+    # 0으로 안 맞아떨어지는 한). Duan(1983) smearing estimator: 재학습 없이
+    # out-of-fold 잔차의 exp() 평균을 모델별로 곱해서 이 편향을 보정한다.
+    cost_oof = oof_predictions(matrix, cost_targets, folds=5, alpha=cost_alpha)
+    cost_smear = np.exp(cost_targets - cost_oof).mean(axis=0)
+    print(
+        "cost smearing 보정계수(모델별, out-of-fold): "
+        + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_smear))
+    )
+
     score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(
         matrix, score_targets, score_alpha
     )
@@ -199,6 +210,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "log_cost_heads": {
             model_id: head_dict(cost_intercept[i], cost_coefficients[:, i])
             for i, model_id in enumerate(MODEL_IDS)
+        },
+        "cost_smear": {
+            model_id: float(cost_smear[i]) for i, model_id in enumerate(MODEL_IDS)
         },
         "tier_safety_ratios": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
         "risk_multiplier": {model_id: 1.0 for model_id in MODEL_IDS},  # placeholder

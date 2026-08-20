@@ -353,6 +353,7 @@ class _TeamArtifact:
         "feature_scale",
         "score_heads",
         "log_cost_heads",
+        "cost_smear",
         "tier_safety_ratios",
         "risk_multiplier",
     )
@@ -367,6 +368,11 @@ class _TeamArtifact:
 _TEAM_ARTIFACT_JSON = r'''
 {
   "artifact_type": "team-router-v1",
+  "cost_smear": {
+    "ax31": 1.4714199637806362,
+    "ax31-light": 1.6713401459391355,
+    "axk1-think": 1.8447468417633073
+  },
   "dense_feature_names": [
     "character_count_log1p",
     "word_count_log1p",
@@ -1741,9 +1747,9 @@ _TEAM_ARTIFACT_JSON = r'''
   "policy_id": "ossp-2026-prompt-router-v1",
   "policy_sha256": "7c892c423da5fa762e7e1a93b9fa071be51e259b65d2b63a5ba434c4342d7a8e",
   "risk_multiplier": {
-    "ax31": 1.0,
+    "ax31": 2.0,
     "ax31-light": 1.0,
-    "axk1-think": 4.0
+    "axk1-think": 2.5
   },
   "schema_version": 1,
   "score_heads": {
@@ -2562,8 +2568,8 @@ _TEAM_ARTIFACT_JSON = r'''
     }
   },
   "tier_safety_ratios": {
-    "balanced": 0.9,
-    "fast": 0.82,
+    "balanced": 0.8,
+    "fast": 0.5,
     "premium": 0.7
   }
 }
@@ -2588,6 +2594,7 @@ def _team_parse_artifact(text: str) -> _TeamArtifact:
         feature_scale=tuple(float(v) for v in value["feature_scale"]),
         score_heads={m: head(value["score_heads"][m]) for m in _TEAM_MODEL_IDS},
         log_cost_heads={m: head(value["log_cost_heads"][m]) for m in _TEAM_MODEL_IDS},
+        cost_smear={m: float(value["cost_smear"][m]) for m in _TEAM_MODEL_IDS},
         tier_safety_ratios={t: float(value["tier_safety_ratios"][t]) for t in TIERS},
         risk_multiplier={m: float(value["risk_multiplier"][m]) for m in _TEAM_MODEL_IDS},
     )
@@ -2625,6 +2632,7 @@ def _team_predict_episode(
         m: _team_math.exp(
             min(50.0, max(-50.0, _team_linear(artifact.log_cost_heads[m], standardized)))
         )
+        * artifact.cost_smear[m]
         for m in _TEAM_MODEL_IDS
     }
     light, mid, high = _TEAM_MODEL_IDS
