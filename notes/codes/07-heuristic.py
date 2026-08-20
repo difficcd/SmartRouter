@@ -2639,16 +2639,18 @@ def _team_parse_artifact(text: str) -> _TeamArtifact:
         tier_safety_ratios={t: float(value["tier_safety_ratios"][t]) for t in TIERS},
         risk_multiplier={m: float(value["risk_multiplier"][m]) for m in _TEAM_MODEL_IDS},
     )
+# 단순하게 json 넣으면 각 타입에 맞게 잘 처리해서 _TeamArtifact 로 return 해주는 함수.
 
 
 _team_artifact_singleton: Optional[_TeamArtifact] = None
-
-
 def _team_load_artifact() -> _TeamArtifact:
     global _team_artifact_singleton
     if _team_artifact_singleton is None:
         _team_artifact_singleton = _team_parse_artifact(_TEAM_ARTIFACT_JSON)
     return _team_artifact_singleton
+# artifact 상태관리. 없으면 가져오고, 있으면 그대로 return 
+
+
 
 
 # ---- predict: q̂(x, m) and ĉ(x, m) for one episode -----------------------
@@ -2656,6 +2658,11 @@ def _team_load_artifact() -> _TeamArtifact:
 
 def _team_linear(head: _TeamLinearHead, values: Sequence[float]) -> float:
     return head.intercept + _team_math.fsum(c * v for c, v in zip(head.coefficients, values))
+# fsum == decimal 처럼(decimal 수준까진 아니지만) 부동소수점연산 오차 줄여서 sum해줌.
+# fsum 결과 == coeffic * 정규화 raw 의 sum. shape = (features_cnt,) : (266,)
+# score_head[m] 하나에 대한 최종 예측 점수(Raw Score) 계산 
+# score/cost_heads, 정규화된 raw data 받아서 (절편 + fsum 결과) float return
+
 
 
 def _team_predict_episode(
@@ -2680,7 +2687,8 @@ def _team_predict_episode(
     scores = {
         m: min(1.0, max(0.0, _team_linear(artifact.score_heads[m], standardized)))
         for m in _TEAM_MODEL_IDS
-    }  
+    }
+    # scores 범위에 맞게 예측 결과의 범위를 0.0~1.0 으로 맞추기 (정답범위)
 
     costs = {
         m: _team_math.exp(
@@ -2688,14 +2696,21 @@ def _team_predict_episode(
         )
         for m in _TEAM_MODEL_IDS
     }
-    
+    # costs 예측 결과의 범위를 -50.0~50.0 으로 맞추기 (exp()함수를 위한 안전장치.)
+    # exp() : log_costs 에서 log를 벗기고 실제 원래 비용을 알아내기 위함
 
     light, mid, high = _TEAM_MODEL_IDS
 
     costs[mid] = max(costs[mid], costs[light] * (1.0 + 1e-12))
     costs[high] = max(costs[high], costs[mid] * (1.0 + 1e-12))
+    # mid는 light와, high는 mid와 차이가 크게 나는지, 조금 나는지 비교해서 미세 조정
 
-    return scores, costs
+    return scores, costs 
+# artifact 의 score_heads, log_cost_head 받아서 정규화 artifact raw data (feature_cnt,)로 예측한 후
+# log_costs => costs 로 만들며 범위 조정, scores 도 범위 조정해서 return 해줌.
+
+
+
 
 
 # ---- allocate: batch-level λ-bisection with per-model risk multiplier ------
@@ -2709,6 +2724,9 @@ def _team_select_models(
     safety_ratio: float,
     risk_multiplier: _TeamMapping[str, float],
 ) -> _TeamTuple[str, ...]:
+    # calibrate_safety.py의 allocate_vectorized()와 거의 동일 (λ-이분탐색)
+    # 컨테이너에 numpy(외부lib) 의존성 포함하지 않기
+
     light_total = _team_math.fsum(row[_TEAM_MODEL_IDS[0]] for row in predicted_costs)
     cap = light_total * max(1.0, budget_multiplier * safety_ratio)
 
@@ -2748,6 +2766,8 @@ def _team_select_models(
         selected = tuple(_TEAM_MODEL_IDS[0] for _row in predicted_scores)
 
     return selected
+# returns choice : 각 문항별로 선택된 모델의 인덱스 배열 반환.
+# 라우팅의 핵심 함수로, 이부분을 개선할 여지가 많음.
 
 
 # ---- router_main: the real entry point (container/entrypoint.py uses this) -
@@ -2756,7 +2776,10 @@ def _team_select_models(
 def team_router_make_submission(
     inputs: InputBatch, policy: RoutingPolicy, tier: str
 ) -> Submission:
+    
     artifact = _team_load_artifact()
+
+    #  무결성 검증 조건분기
     if inputs.schema_version != policy.schema_version:
         raise ProtocolError("입력과 정책의 schema_version이 일치하지 않습니다.")
     if tier not in TIERS:
@@ -2768,11 +2791,14 @@ def team_router_make_submission(
 
     predicted_scores = []
     predicted_costs = []
+
+    # 문항마다 predict 수행.
     for episode in inputs.episodes:
         scores, costs = _team_predict_episode(episode, artifact)
         predicted_scores.append(scores)
         predicted_costs.append(costs)
 
+    # 다 예측되면 select models
     selected = _team_select_models(
         predicted_scores,
         predicted_costs,
@@ -2793,10 +2819,12 @@ def team_router_make_submission(
         ),
     )
     return parse_submission(submission_to_dict(submission))
+# 제출 요건에 맞게 포장해서 return
 
-
+# 컨테이너 돌리면 제일 먼저 오는 곳 (entrypoint check!)
 def router_main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
+
     try:
         inputs = load_input(args.input)
         policy = (
@@ -2804,10 +2832,13 @@ def router_main(argv: Optional[Sequence[str]] = None) -> int:
         )
         submission = team_router_make_submission(inputs, policy, args.tier)
         write_submission_atomic(args.output, submission)
+
     except (OSError, ProtocolError, ValueError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
+    
     print(f"OK: {args.tier} 제출 파일을 생성했습니다.")
+
     return 0
 
 
@@ -2818,3 +2849,8 @@ def router_main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# heuristic == 다 만들어진 코드들로 실제로 돌리는 컨테이너에 들어갈 로직.
+# python3 entrypoint.py => router_main() ...
+
+
