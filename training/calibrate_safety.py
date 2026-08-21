@@ -7,21 +7,29 @@ not from maximizing Dev score. This is the fix for the exact failure mode
 then blew past it on the hidden eval set).
 
 Method (per tier):
-  1. Build predicted and real (score, cost) matrices for Dev once.
-  2. For a grid of (risk_multiplier[axk1-think], safety_ratio):
-     bootstrap-resample Dev episodes (with replacement) K times; for each
-     resample, re-run the SAME batch-level allocation the router will run
-     (light_total and λ are recomputed per resample, since that's what an
-     official grader would compute for a differently-composed hidden batch)
-     and measure the REALIZED budget ratio and tier score against the real
-     outcomes.
-  3. Reject any (risk_multiplier, safety_ratio) whose bootstrap overrun
-     probability exceeds --overrun-target; among what's left, keep the one
-     with the highest mean tier score.
-  4. risk_multiplier is shared across tiers (it's a property of how much we
-     trust the model's cost prediction, not of the budget); safety_ratio is
-     per-tier. Pick the one risk_multiplier that maximizes the *weighted*
-     score across all three tiers.
+  1. Build predicted and real (score, cost) matrices for BOTH public splits
+     (Dev and Train) once.
+  2. For a grid of (risk_mid, risk_high, safety_ratio): bootstrap-resample
+     each split's episodes (with replacement) K times; for each resample,
+     re-run the SAME batch-level allocation the router will run (light_total
+     and λ are recomputed per resample, since that's what an official grader
+     would compute for a differently-composed hidden batch) and measure the
+     REALIZED budget ratio and tier score against the real outcomes.
+  3. Reject any setting whose overrun probability exceeds OVERRUN_TARGET on
+     EITHER split; among what's left, keep the one with the highest mean
+     score across splits.
+  4. risk_mid/risk_high/safety_ratio are all per-tier -- fast and premium
+     want genuinely different values (fast's 1.25x budget is razor thin,
+     premium's 4.0x can absorb a miss), so a shared value helps neither.
+
+Why both splits: calibrating on Dev alone produced settings that sat at
+cost ratio 3.14 on Dev (comfortably safe) and 4.13 on Train -- over the 4.0
+limit, scoring Premium 0. Bootstrapping a single split only models
+resampling within that split's composition and is blind to Dev and Train
+being genuinely different populations (all-light 0.5973 vs 0.6193,
+axk1-best 20.4% vs 17.7%). That blindness is precisely what cost
+hash_regex its Premium tier, so requiring a setting to survive two
+different compositions is the point of this script, not a detail.
 
 The inner allocation loop is vectorized with NumPy for speed (training-only;
 the shipped src/team_router/allocate.py stays pure Python). Uses the exact
@@ -206,11 +214,7 @@ def allocate_vectorized(
 
 
 def bootstrap_evaluate(
-    pred_scores: np.ndarray,
-    pred_costs: np.ndarray,
-    pred_rank_costs: np.ndarray,
-    real_scores: np.ndarray,
-    real_costs: np.ndarray,
+    splits,
     *,
     budget_multiplier: float,
     safety_ratio: float,
@@ -219,41 +223,58 @@ def bootstrap_evaluate(
     rng: np.random.Generator,
     k: int = BOOTSTRAP_K,
 ) -> Tuple[float, float]:
-    """Returns (overrun_probability, mean_tier_score) over k bootstrap resamples."""
+    """Bootstrap every split and return (WORST overrun probability, mean score).
 
-    n = len(pred_scores)
-    overruns = 0
-    score_total = 0.0
-    for _ in range(k):
-        index = rng.integers(0, n, size=n)
-        choice = allocate_vectorized(
-            pred_scores[index],
-            pred_costs[index],
-            pred_rank_costs[index],
-            budget_multiplier=budget_multiplier,
-            safety_ratio=safety_ratio,
-            risk_multiplier=risk_multiplier,
-            high_cap_ratio=high_cap_ratio,
-        )
-        real_light_total = real_costs[index, 0].sum()
-        # gather realized cost/score for the chosen column, per resampled row
-        chosen_real_cost = real_costs[index, choice]
-        chosen_real_score = real_scores[index, choice]
-        real_total = chosen_real_cost.sum()
-        budget_limit = real_light_total * budget_multiplier
-        if real_total > budget_limit:
-            overruns += 1
-        else:
-            score_total += float(chosen_real_score.mean())
-    return overruns / k, score_total / k
+    `splits` is a list of (pred_scores, pred_costs, pred_rank_costs,
+    real_scores, real_costs) -- normally public Dev and public Train.
+
+    Calibrating on Dev alone was a real, measured failure: settings tuned
+    that way put Dev's premium at cost ratio 3.14 (safe) while the same
+    settings hit 4.13 on Train, over the 4.0 limit, scoring the tier 0.
+    Bootstrapping one split only models resampling WITHIN that split's
+    composition; it cannot see that Train and Dev are genuinely different
+    populations (all-light 0.5973 vs 0.6193, axk1-best 20.4% vs 17.7%),
+    which is the same blind spot that cost `baselines/hash_regex.py` its
+    Premium tier on the hidden eval set.
+
+    Taking the worst overrun across splits forces a setting to survive two
+    different compositions before we trust it on a third we cannot see.
+    """
+
+    worst_overrun = 0.0
+    split_scores = []
+    for pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs in splits:
+        n = len(pred_scores)
+        overruns = 0
+        score_total = 0.0
+        for _ in range(k):
+            index = rng.integers(0, n, size=n)
+            choice = allocate_vectorized(
+                pred_scores[index],
+                pred_costs[index],
+                pred_rank_costs[index],
+                budget_multiplier=budget_multiplier,
+                safety_ratio=safety_ratio,
+                risk_multiplier=risk_multiplier,
+                high_cap_ratio=high_cap_ratio,
+            )
+            real_light_total = real_costs[index, 0].sum()
+            # gather realized cost/score for the chosen column, per resampled row
+            chosen_real_cost = real_costs[index, choice]
+            chosen_real_score = real_scores[index, choice]
+            real_total = chosen_real_cost.sum()
+            budget_limit = real_light_total * budget_multiplier
+            if real_total > budget_limit:
+                overruns += 1
+            else:
+                score_total += float(chosen_real_score.mean())
+        worst_overrun = max(worst_overrun, overruns / k)
+        split_scores.append(score_total / k)
+    return worst_overrun, float(np.mean(split_scores))
 
 
 def calibrate_tier(
-    pred_scores,
-    pred_costs,
-    pred_rank_costs,
-    real_scores,
-    real_costs,
+    splits,
     *,
     tier: str,
     budget_multiplier: float,
@@ -269,11 +290,7 @@ def calibrate_tier(
     fallback = None  # lowest-overrun candidate, in case nothing meets the target
     for safety_ratio in SAFETY_GRID:
         overrun_prob, mean_score = bootstrap_evaluate(
-            pred_scores,
-            pred_costs,
-            pred_rank_costs,
-            real_scores,
-            real_costs,
+            splits,
             budget_multiplier=budget_multiplier,
             safety_ratio=safety_ratio,
             risk_multiplier=risk_multiplier,
@@ -290,31 +307,26 @@ def calibrate_tier(
 
 
 # ---- parallel search over (tier, risk_mid, risk_high) --------------------
-# The Dev matrices are identical for every task and only ~85 KB, so they're
-# sent to each worker once at startup rather than with every task.
+# The split matrices are identical for every task and only a few hundred KB,
+# so they're sent to each worker once at startup rather than with every task.
 
-_WORKER_MATRICES: Tuple[np.ndarray, ...] | None = None
+_WORKER_SPLITS = None
 
 
-def _init_worker(pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs) -> None:
-    global _WORKER_MATRICES
-    _WORKER_MATRICES = (pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs)
+def _init_worker(splits) -> None:
+    global _WORKER_SPLITS
+    _WORKER_SPLITS = splits
 
 
 def _calibrate_task(task):
     tier, budget_multiplier, risk_mid, risk_high = task
-    assert _WORKER_MATRICES is not None
-    pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs = _WORKER_MATRICES
+    assert _WORKER_SPLITS is not None
     # Seed from the task's own coordinates so the result doesn't depend on
     # which worker picked it up or in what order.
     # TIERS index, not hash(tier) -- string hashing is randomized per process.
     seed = (RNG_SEED, TIERS.index(tier), int(risk_mid * 100), int(risk_high * 100))
     result = calibrate_tier(
-        pred_scores,
-        pred_costs,
-        pred_rank_costs,
-        real_scores,
-        real_costs,
+        _WORKER_SPLITS,
         tier=tier,
         budget_multiplier=budget_multiplier,
         risk_mid=risk_mid,
@@ -329,6 +341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--dev-input", type=Path, required=True)
     parser.add_argument("--dev-outcomes", type=Path, required=True)
+    parser.add_argument("--train-input", type=Path, required=True)
+    parser.add_argument("--train-outcomes", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--workers",
@@ -342,12 +356,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     artifact = load_artifact(args.artifact)
     dev_inputs = load_input(args.dev_input)
     dev_outcomes = load_outcomes(args.dev_outcomes)
+    train_inputs = load_input(args.train_input)
+    train_outcomes = load_outcomes(args.train_outcomes)
 
-    print(f"Dev 문항 수: {len(dev_inputs.episodes)}")
-    print("예측 계산 중...")
-    pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs = build_matrices(
-        dev_inputs, dev_outcomes, policy, artifact
+    print(
+        f"Dev 문항 수: {len(dev_inputs.episodes)}  "
+        f"Train 문항 수: {len(train_inputs.episodes)}"
     )
+    print("예측 계산 중...")
+    # Both public splits, evaluated together -- a setting has to be safe on
+    # each of them (see bootstrap_evaluate's docstring for why Dev alone
+    # was not enough).
+    splits = [
+        build_matrices(dev_inputs, dev_outcomes, policy, artifact),
+        build_matrices(train_inputs, train_outcomes, policy, artifact),
+    ]
 
     rng = np.random.default_rng(RNG_SEED)
     budget_multipliers = {tier: float(policy.tiers[tier].budget_multiplier) for tier in TIERS}
@@ -382,7 +405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_worker,
-        initargs=(pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs),
+        initargs=(splits,),
     ) as pool:
         for tier, risk_mid, risk_high, result in pool.map(_calibrate_task, tasks):
             safety_ratio, overrun_prob, mean_score = result
@@ -411,11 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         chosen = 1.0
         for high_cap_ratio in sorted(HIGH_CAP_GRID):
             overrun_prob, mean_score = bootstrap_evaluate(
-                pred_scores,
-                pred_costs,
-                pred_rank_costs,
-                real_scores,
-                real_costs,
+                splits,
                 budget_multiplier=budget_multipliers[tier],
                 safety_ratio=safety_ratio,
                 risk_multiplier=risk_multiplier,
