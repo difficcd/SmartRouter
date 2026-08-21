@@ -148,6 +148,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--matrices", required=True)
     parser.add_argument("--tiers", nargs="+", default=TIER_ORDER)
+    parser.add_argument(
+        "--risk-high",
+        nargs="+",
+        type=float,
+        default=None,
+        help="RISK_HIGH_GRID 중 이 값들만 탐색 (한 등급을 여러 대에 쪼갤 때). "
+             "부분 결과들은 apply_search.py가 등급별 최고점으로 합친다.",
+    )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
@@ -155,13 +163,18 @@ def main(argv=None) -> int:
     splits, data = load_splits(args.matrices)
     budget_multipliers = dict(zip(TIER_ORDER, data["budget_multipliers"].tolist()))
 
+    risk_high_grid = args.risk_high if args.risk_high else RISK_HIGH_GRID
+    unknown = set(risk_high_grid) - set(RISK_HIGH_GRID)
+    if unknown:
+        parser.error(f"RISK_HIGH_GRID에 없는 값: {sorted(unknown)}")
     jobs = [
         (tier, budget_multipliers[tier], risk_mid, risk_high)
         for tier in args.tiers
-        for risk_high in RISK_HIGH_GRID
+        for risk_high in risk_high_grid
         for risk_mid in RISK_MID_GRID
     ]
-    print(f"등급 {args.tiers}: {len(jobs)}개 조합, 프로세스 {args.workers}개, K={BOOTSTRAP_K}")
+    print(f"등급 {args.tiers} risk_high={risk_high_grid}: "
+          f"{len(jobs)}개 조합, 프로세스 {args.workers}개, K={BOOTSTRAP_K}")
     print(f"Dev {len(splits[0][0])}문항 / Train {len(splits[1][0])}문항, 두 split 모두 안전해야 채택\n")
 
     best = {}
@@ -179,6 +192,25 @@ def main(argv=None) -> int:
                 }
 
     # Tighten the hard axk1 cap where it's free, now that the rest is fixed.
+    # Only meaningful once a tier's whole grid has been seen -- with a partial
+    # --risk-high slice, this machine's local winner may not be the tier's
+    # actual winner, so leave the cap open and let apply_search.py decide after
+    # the slices are merged.
+    partial = args.risk_high is not None and set(risk_high_grid) != set(RISK_HIGH_GRID)
+    if partial:
+        for tier in args.tiers:
+            best[tier]["high_cap_ratio"] = 1.0
+            b = best[tier]
+            print(
+                f"{tier:9} (부분 탐색) risk[ax31]={b['risk_mid']:.2f} "
+                f"risk[axk1]={b['risk_high']:.2f} safety={b['safety_ratio']:.2f} "
+                f"최악초과율={b['overrun']:.3f} 점수={b['score']:.4f}"
+            )
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(best, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        print(f"\nOK: {args.out} (부분 결과 -- 다른 조각과 합쳐야 함)")
+        return 0
+
     for tier in args.tiers:
         b = best[tier]
         rng = np.random.default_rng((RNG_SEED, 999, TIER_ORDER.index(tier)))
