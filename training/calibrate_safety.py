@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence, Tuple
@@ -268,12 +270,52 @@ def calibrate_tier(
     return safety_ratio, overrun_prob, mean_score
 
 
+# ---- parallel search over (tier, risk_mid, risk_high) --------------------
+# The Dev matrices are identical for every task and only ~85 KB, so they're
+# sent to each worker once at startup rather than with every task.
+
+_WORKER_MATRICES: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+
+
+def _init_worker(pred_scores, pred_costs, real_scores, real_costs) -> None:
+    global _WORKER_MATRICES
+    _WORKER_MATRICES = (pred_scores, pred_costs, real_scores, real_costs)
+
+
+def _calibrate_task(task):
+    tier, budget_multiplier, risk_mid, risk_high = task
+    assert _WORKER_MATRICES is not None
+    pred_scores, pred_costs, real_scores, real_costs = _WORKER_MATRICES
+    # Seed from the task's own coordinates so the result doesn't depend on
+    # which worker picked it up or in what order.
+    # TIERS index, not hash(tier) -- string hashing is randomized per process.
+    seed = (RNG_SEED, TIERS.index(tier), int(risk_mid * 100), int(risk_high * 100))
+    result = calibrate_tier(
+        pred_scores,
+        pred_costs,
+        real_scores,
+        real_costs,
+        tier=tier,
+        budget_multiplier=budget_multiplier,
+        risk_mid=risk_mid,
+        risk_high=risk_high,
+        rng=np.random.default_rng(seed),
+    )
+    return tier, risk_mid, risk_high, result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--dev-input", type=Path, required=True)
     parser.add_argument("--dev-outcomes", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="병렬 프로세스 수 (기본: 코어의 1/4 -- 작업 중인 노트북을 위한 여유)",
+    )
     args = parser.parse_args(argv)
 
     policy = load_bundled_policy()
@@ -299,27 +341,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     # -- a shared value forces a compromise that helps neither. Each tier
     # now searches its own (risk_mid, risk_high, safety_ratio) independently
     # and keeps whichever wins for itself; risk_multiplier is per-tier below.
-    print(f"\n부트스트랩 K={BOOTSTRAP_K}, 목표 초과율 <= {OVERRUN_TARGET:.0%}  (등급별 독립 탐색)\n")
+    # Every (tier, risk_mid, risk_high) combination is independent, so run them
+    # across processes. Each task reseeds from RNG_SEED plus its own coordinates
+    # rather than sharing one Generator, so results no longer depend on
+    # evaluation order and are reproducible regardless of worker count.
+    # Deliberately leave most of the machine free -- this runs on a laptop the
+    # user is also working on. --workers overrides.
+    workers = args.workers or max(1, (os.cpu_count() or 4) // 4)
+    tasks = [
+        (tier, budget_multipliers[tier], risk_mid, risk_high)
+        for tier in TIERS
+        for risk_high in RISK_HIGH_GRID
+        for risk_mid in RISK_MID_GRID
+    ]
+    print(
+        f"\n부트스트랩 K={BOOTSTRAP_K}, 목표 초과율 <= {OVERRUN_TARGET:.0%}  "
+        f"(등급별 독립 탐색, {len(tasks)}개 조합을 프로세스 {workers}개로 병렬 처리)\n"
+    )
     per_tier = {}  # tier -> (risk_mid, risk_high, safety_ratio, overrun, score)
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(pred_scores, pred_costs, real_scores, real_costs),
+    ) as pool:
+        for tier, risk_mid, risk_high, result in pool.map(_calibrate_task, tasks):
+            safety_ratio, overrun_prob, mean_score = result
+            candidate = (risk_mid, risk_high, safety_ratio, overrun_prob, mean_score)
+            if tier not in per_tier or mean_score > per_tier[tier][4]:
+                per_tier[tier] = candidate
+
     for tier in TIERS:
-        best = None
-        for risk_high in RISK_HIGH_GRID:
-            for risk_mid in RISK_MID_GRID:
-                safety_ratio, overrun_prob, mean_score = calibrate_tier(
-                    pred_scores,
-                    pred_costs,
-                    real_scores,
-                    real_costs,
-                    tier=tier,
-                    budget_multiplier=budget_multipliers[tier],
-                    risk_mid=risk_mid,
-                    risk_high=risk_high,
-                    rng=rng,
-                )
-                if best is None or mean_score > best[4]:
-                    best = (risk_mid, risk_high, safety_ratio, overrun_prob, mean_score)
-        per_tier[tier] = best
-        risk_mid, risk_high, safety_ratio, overrun_prob, mean_score = best
+        risk_mid, risk_high, safety_ratio, overrun_prob, mean_score = per_tier[tier]
         print(
             f"{tier:9} risk[ax31]={risk_mid:.2f} risk[axk1-think]={risk_high:.2f} "
             f"safety={safety_ratio:.2f}  초과율={overrun_prob:.3f}  점수={mean_score:.4f}"
