@@ -32,10 +32,17 @@ import numpy as np
 RNG_SEED = 20260815
 BOOTSTRAP_K = 300
 OVERRUN_TARGET = 0.01
-SCORE_TOLERANCE = 0.001
+# How much bootstrap score we will pay to buy a hard axk1 ceiling. At
+# 0.001 the search never found a binding cap (v13 chose 1.0 = no cap for
+# all three tiers), so the backstop we built has never actually engaged.
+# Overrunning costs the whole tier, so a few thousandths is cheap here.
+SCORE_TOLERANCE = 0.006
+# safety_ratio is now "share of the tier's allowed excess" (see allocate's
+# cap), so the whole 0-1 range is live for every tier -- the old fine steps
+# clustered at 0.80-1.00 were an artifact of fast's dead zone below 0.80.
 SAFETY_GRID = [
-    0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80,
-    0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00,
+    0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
+    0.80, 0.84, 0.88, 0.92, 0.96, 1.00,
 ]
 RISK_HIGH_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0]
 RISK_MID_GRID = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
@@ -47,7 +54,21 @@ def allocate(pred_scores, pred_costs, pred_rank_costs, *, budget_multiplier,
              safety_ratio, risk_multiplier, high_cap_ratio=1.0, iterations=60):
     light_total = pred_costs[:, 0].sum()
     rank_light_total = pred_rank_costs[:, 0].sum()
-    cap = light_total * max(1.0, budget_multiplier * safety_ratio)
+    # safety_ratio scales the ALLOWED EXCESS, not the whole multiplier.
+    #
+    # The old form (light_total * max(1.0, budget_multiplier * safety_ratio))
+    # made safety_ratio mean wildly different things per tier: premium's 4.0x
+    # budget at safety 0.7 still allowed 2.8x, but fast's 1.25x at safety 0.7
+    # hit the max(1.0, ...) floor and allowed no promotion at all. Every
+    # safety_ratio below 0.80 was the same dead value for fast, and 0.84 --
+    # the value the search kept picking -- bought only 5% of the 25% it was
+    # allowed to spend.
+    #
+    # Reading it as a fraction of the excess makes the parameter mean the same
+    # thing everywhere ("spend this share of what the tier may spend beyond
+    # all-light") and gives fast the same search resolution the other tiers
+    # already had.
+    cap = light_total * (1.0 + (budget_multiplier - 1.0) * safety_ratio)
     high_cap = cap * high_cap_ratio
 
     def choose(penalty):

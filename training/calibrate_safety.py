@@ -176,7 +176,21 @@ def allocate_vectorized(
     # (two fits of the same quantity -- see train_router.py).
     light_total = pred_costs[:, 0].sum()
     rank_light_total = pred_rank_costs[:, 0].sum()
-    cap = light_total * max(1.0, budget_multiplier * safety_ratio)
+    # safety_ratio scales the ALLOWED EXCESS, not the whole multiplier.
+    #
+    # The old form (light_total * max(1.0, budget_multiplier * safety_ratio))
+    # made safety_ratio mean wildly different things per tier: premium's 4.0x
+    # budget at safety 0.7 still allowed 2.8x, but fast's 1.25x at safety 0.7
+    # hit the max(1.0, ...) floor and allowed no promotion at all. Every
+    # safety_ratio below 0.80 was the same dead value for fast, and 0.84 --
+    # the value the search kept picking -- bought only 5% of the 25% it was
+    # allowed to spend.
+    #
+    # Reading it as a fraction of the excess makes the parameter mean the same
+    # thing everywhere ("spend this share of what the tier may spend beyond
+    # all-light") and gives fast the same search resolution the other tiers
+    # already had.
+    cap = light_total * (1.0 + (budget_multiplier - 1.0) * safety_ratio)
     high_cap = cap * high_cap_ratio
 
     def choose(penalty: float) -> Tuple[np.ndarray, float, float]:
