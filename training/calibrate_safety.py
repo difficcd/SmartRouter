@@ -71,12 +71,15 @@ def load_artifact(path: Path):
 
 
 def predict_batch(episodes, artifact):
-    scores, costs = [], []
+    scores, costs, rank_costs = [], [], []
     for episode in episodes:
-        episode_scores, episode_costs = _team_predict_episode(episode, artifact)
+        episode_scores, episode_costs, episode_rank_costs = _team_predict_episode(
+            episode, artifact
+        )
         scores.append(episode_scores)
         costs.append(episode_costs)
-    return scores, costs
+        rank_costs.append(episode_rank_costs)
+    return scores, costs, rank_costs
 
 
 RNG_SEED = 20260815
@@ -114,30 +117,36 @@ def _real_cost(outcome, policy: RoutingPolicy) -> float:
 
 def build_matrices(
     inputs: InputBatch, outcomes: OutcomeBatch, policy: RoutingPolicy, artifact
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (predicted_scores, predicted_costs, real_scores, real_costs), each (n, 3)."""
-    predicted_scores, predicted_costs = predict_batch(inputs.episodes, artifact)
+):
+    """Returns (pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs),
+    each (n, len(MODEL_IDS))."""
+    predicted_scores, predicted_costs, predicted_rank_costs = predict_batch(
+        inputs.episodes, artifact
+    )
     outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
 
     n = len(inputs.episodes)
     n_models = len(MODEL_IDS)
     pred_scores = np.empty((n, n_models), dtype=np.float64)
     pred_costs = np.empty((n, n_models), dtype=np.float64)
+    pred_rank_costs = np.empty((n, n_models), dtype=np.float64)
     real_scores = np.empty((n, n_models), dtype=np.float64)
     real_costs = np.empty((n, n_models), dtype=np.float64)
     for row, episode in enumerate(inputs.episodes):
         for col, model_id in enumerate(MODEL_IDS):
             pred_scores[row, col] = predicted_scores[row][model_id]
             pred_costs[row, col] = predicted_costs[row][model_id]
+            pred_rank_costs[row, col] = predicted_rank_costs[row][model_id]
             outcome = outcome_index[(episode.episode_id, model_id)]
             real_scores[row, col] = float(outcome.score)
             real_costs[row, col] = _real_cost(outcome, policy)
-    return pred_scores, pred_costs, real_scores, real_costs
+    return pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs
 
 
 def allocate_vectorized(
     pred_scores: np.ndarray,
     pred_costs: np.ndarray,
+    pred_rank_costs: np.ndarray,
     *,
     budget_multiplier: float,
     safety_ratio: float,
@@ -155,12 +164,18 @@ def allocate_vectorized(
     (the exact hash_regex failure). 1.0 = no-op (identical to not having
     this constraint at all, since high_total <= total <= cap already)."""
 
+    # pred_costs feeds the budget; pred_rank_costs feeds the EV comparison
+    # (two fits of the same quantity -- see train_router.py).
     light_total = pred_costs[:, 0].sum()
+    rank_light_total = pred_rank_costs[:, 0].sum()
     cap = light_total * max(1.0, budget_multiplier * safety_ratio)
     high_cap = cap * high_cap_ratio
 
     def choose(penalty: float) -> Tuple[np.ndarray, float, float]:
-        ev = pred_scores - penalty * risk_multiplier[None, :] * pred_costs / light_total
+        ev = (
+            pred_scores
+            - penalty * risk_multiplier[None, :] * pred_rank_costs / rank_light_total
+        )
         choice = np.argmax(ev, axis=1)  # ties -> first (cheapest) column, matches -index tie-break
         total = pred_costs[np.arange(len(choice)), choice].sum()
         high_total = pred_costs[choice == 2, 2].sum()
@@ -193,6 +208,7 @@ def allocate_vectorized(
 def bootstrap_evaluate(
     pred_scores: np.ndarray,
     pred_costs: np.ndarray,
+    pred_rank_costs: np.ndarray,
     real_scores: np.ndarray,
     real_costs: np.ndarray,
     *,
@@ -213,6 +229,7 @@ def bootstrap_evaluate(
         choice = allocate_vectorized(
             pred_scores[index],
             pred_costs[index],
+            pred_rank_costs[index],
             budget_multiplier=budget_multiplier,
             safety_ratio=safety_ratio,
             risk_multiplier=risk_multiplier,
@@ -234,6 +251,7 @@ def bootstrap_evaluate(
 def calibrate_tier(
     pred_scores,
     pred_costs,
+    pred_rank_costs,
     real_scores,
     real_costs,
     *,
@@ -253,6 +271,7 @@ def calibrate_tier(
         overrun_prob, mean_score = bootstrap_evaluate(
             pred_scores,
             pred_costs,
+            pred_rank_costs,
             real_scores,
             real_costs,
             budget_multiplier=budget_multiplier,
@@ -274,18 +293,18 @@ def calibrate_tier(
 # The Dev matrices are identical for every task and only ~85 KB, so they're
 # sent to each worker once at startup rather than with every task.
 
-_WORKER_MATRICES: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+_WORKER_MATRICES: Tuple[np.ndarray, ...] | None = None
 
 
-def _init_worker(pred_scores, pred_costs, real_scores, real_costs) -> None:
+def _init_worker(pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs) -> None:
     global _WORKER_MATRICES
-    _WORKER_MATRICES = (pred_scores, pred_costs, real_scores, real_costs)
+    _WORKER_MATRICES = (pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs)
 
 
 def _calibrate_task(task):
     tier, budget_multiplier, risk_mid, risk_high = task
     assert _WORKER_MATRICES is not None
-    pred_scores, pred_costs, real_scores, real_costs = _WORKER_MATRICES
+    pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs = _WORKER_MATRICES
     # Seed from the task's own coordinates so the result doesn't depend on
     # which worker picked it up or in what order.
     # TIERS index, not hash(tier) -- string hashing is randomized per process.
@@ -293,6 +312,7 @@ def _calibrate_task(task):
     result = calibrate_tier(
         pred_scores,
         pred_costs,
+        pred_rank_costs,
         real_scores,
         real_costs,
         tier=tier,
@@ -325,7 +345,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"Dev 문항 수: {len(dev_inputs.episodes)}")
     print("예측 계산 중...")
-    pred_scores, pred_costs, real_scores, real_costs = build_matrices(
+    pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs = build_matrices(
         dev_inputs, dev_outcomes, policy, artifact
     )
 
@@ -362,7 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_worker,
-        initargs=(pred_scores, pred_costs, real_scores, real_costs),
+        initargs=(pred_scores, pred_costs, pred_rank_costs, real_scores, real_costs),
     ) as pool:
         for tier, risk_mid, risk_high, result in pool.map(_calibrate_task, tasks):
             safety_ratio, overrun_prob, mean_score = result
@@ -393,6 +413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             overrun_prob, mean_score = bootstrap_evaluate(
                 pred_scores,
                 pred_costs,
+                pred_rank_costs,
                 real_scores,
                 real_costs,
                 budget_multiplier=budget_multipliers[tier],

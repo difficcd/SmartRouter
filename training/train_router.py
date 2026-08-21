@@ -195,9 +195,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates = [10.0**exponent for exponent in range(-1, 7)]
     print("alpha 후보 탐색 -- score와 cost를 따로 고른다 (out-of-fold, 5-fold):")
     score_alpha = select_alpha_single(matrix, score_targets, folds=5, candidates=candidates, label="score")
-    # cost는 실제(exp) 스케일에서 고른다 -- 예산 검사가 사는 공간이 거기다.
-    cost_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
-    print(f"선택된 alpha: score={score_alpha:g}  cost={cost_alpha:g}")
+
+    # The cost prediction does two different jobs and they want opposite
+    # regularization, so fit it twice:
+    #
+    #   BUDGET  -- "what will this batch cost in total?" Feeds cap and the
+    #     official budget check, both of which live in real (exp) space.
+    #     Chosen by real-space error; lands on very heavy regularization.
+    #   RANKING -- "which episode is the best value to promote?" Feeds the
+    #     EV comparison, which only cares about the ratio gain/cost, i.e.
+    #     relative differences between episodes. Chosen by log-space MSE
+    #     (log error == relative error); lands much lighter.
+    #
+    # Measured on Train (fast-tier greedy with perfect cost accounting, so
+    # only ranking quality varies): alpha=300 -> 0.6423, 1000 -> 0.6382,
+    # 1e5 -> 0.6213. Meanwhile real-space error keeps improving all the way
+    # to 1e5. v10 used the real-space alpha for both and won premium (budget
+    # bound) while losing fast (ranking bound); splitting them takes both.
+    cost_budget_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
+    cost_rank_alpha = select_alpha_single(
+        matrix, cost_targets, folds=5, candidates=candidates, label="c-rank"
+    )
+    print(
+        f"선택된 alpha: score={score_alpha:g}  "
+        f"cost(예산)={cost_budget_alpha:g}  cost(랭킹)={cost_rank_alpha:g}"
+    )
 
     # exp()로 log-cost를 원래 스케일로 되돌리면 Jensen 부등식 때문에 구조적으로
     # 과소추정된다. v1은 Duan(1983) smearing(잔차 exp()의 문항별 평균)으로 이걸
@@ -212,20 +234,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 그래서 보정계수를 "out-of-fold 예측 합이 실제 합과 일치하도록" 직접
     # 잡는다. Duan smearing이 문항별 불편추정을 노린다면 이건 배치합 불편추정을
     # 노리는 것 -- 우리 목적함수에 정확히 맞는 쪽.
-    cost_oof = oof_predictions(matrix, cost_targets, folds=5, alpha=cost_alpha)
-    cost_smear = np.exp(cost_targets).sum(axis=0) / np.exp(cost_oof).sum(axis=0)
+    # Both cost models get their own batch-sum correction, since each one's
+    # raw exp() level is off by a different amount.
+    def batch_correction(alpha):
+        oof = oof_predictions(matrix, cost_targets, folds=5, alpha=alpha)
+        return np.exp(cost_targets).sum(axis=0) / np.exp(oof).sum(axis=0)
+
+    cost_smear = batch_correction(cost_budget_alpha)
+    cost_rank_smear = batch_correction(cost_rank_alpha)
     print(
-        "cost 배치합 보정계수(모델별, out-of-fold): "
+        "cost 배치합 보정계수 -- 예산용: "
         + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_smear))
+    )
+    print(
+        "                       랭킹용: "
+        + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_rank_smear))
     )
 
     score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(
         matrix, score_targets, score_alpha
     )
     cost_mean, cost_scale, cost_intercept, cost_coefficients = fit_ridge(
-        matrix, cost_targets, cost_alpha
+        matrix, cost_targets, cost_budget_alpha
+    )
+    rank_mean, rank_scale, rank_intercept, rank_coefficients = fit_ridge(
+        matrix, cost_targets, cost_rank_alpha
     )
     assert np.allclose(score_mean, cost_mean) and np.allclose(score_scale, cost_scale)
+    assert np.allclose(score_mean, rank_mean) and np.allclose(score_scale, rank_scale)
     mean, scale = score_mean, score_scale
 
     def head_dict(intercept: float, coefficients) -> dict:
@@ -253,6 +289,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "cost_smear": {
             model_id: float(cost_smear[i]) for i, model_id in enumerate(MODEL_IDS)
+        },
+        "log_cost_rank_heads": {
+            model_id: head_dict(rank_intercept[i], rank_coefficients[:, i])
+            for i, model_id in enumerate(MODEL_IDS)
+        },
+        "cost_rank_smear": {
+            model_id: float(cost_rank_smear[i]) for i, model_id in enumerate(MODEL_IDS)
         },
         "tier_safety_ratios": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
         # placeholder -- per-tier now, since fast/premium want opposite values
