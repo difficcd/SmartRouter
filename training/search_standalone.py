@@ -41,6 +41,11 @@ SCORE_TOLERANCE = 0.006
 # cap), so the whole 0-1 range is live for every tier -- the old fine steps
 # clustered at 0.80-1.00 were an artifact of fast's dead zone below 0.80.
 SAFETY_GRID = [
+    # fast's usable band sits at the very bottom of this range: its excess is
+    # only 0.25x, so safety 0.30 already means cap 1.075, which measured 3%
+    # overrun -- above target. The old parameterization reached that region
+    # through values below 0.80; this one needs the low end spelled out.
+    0.05, 0.10, 0.15, 0.20, 0.25,
     0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
     0.80, 0.84, 0.88, 0.92, 0.96, 1.00,
 ]
@@ -49,9 +54,22 @@ RISK_MID_GRID = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
 HIGH_CAP_GRID = [1.0, 0.90, 0.80, 0.70, 0.60, 0.50]
 TIER_ORDER = ["fast", "balanced", "premium"]
 
+# Deliberately loose upper bounds on each model's batch-level cost multiple
+# relative to ax31-light, keyed by column index. Measured on the public data:
+# ax31 2.1020 (Dev) / 2.1550 (Train); axk1-think 23.795 / 23.150. These bounds
+# sit ~40% above the larger observation, so the share-based constraint in
+# allocate() stays valid across a distribution shift many times larger than
+# anything the two public splits show.
+MODEL_MULTIPLE_BOUND = {1: 3.0, 2: 33.0}
+
+# How much of the tier's allowed excess the share-based bound may claim.
+# 1.0 means "the bound alone must fit inside the budget"; searched per tier.
+SHARE_RATIO_GRID = [1.0, 0.9, 0.8, 0.7, 0.6]
+
 
 def allocate(pred_scores, pred_costs, pred_rank_costs, *, budget_multiplier,
-             safety_ratio, risk_multiplier, high_cap_ratio=1.0, iterations=60):
+             safety_ratio, risk_multiplier, high_cap_ratio=1.0,
+             share_ratio=1.0, iterations=60):
     light_total = pred_costs[:, 0].sum()
     rank_light_total = pred_rank_costs[:, 0].sum()
     # safety_ratio scales the ALLOWED EXCESS, not the whole multiplier.
@@ -71,38 +89,69 @@ def allocate(pred_scores, pred_costs, pred_rank_costs, *, budget_multiplier,
     cap = light_total * (1.0 + (budget_multiplier - 1.0) * safety_ratio)
     high_cap = cap * high_cap_ratio
 
+    # Share-based hard constraint (see MODEL_MULTIPLE_BOUND).
+    #
+    # The budget check is really
+    #     ratio = 1 + sum_promoted(c_m(i) - c_light(i)) / L
+    # and grouping by model turns that into
+    #     ratio = 1 + sum_m (rho_m - 1) * s_m
+    # where s_m is the share of the batch's LIGHT cost held by the episodes
+    # promoted to m, and rho_m is that model's batch-level cost multiple.
+    #
+    # This is worth doing because the two quantities have wildly different
+    # reliability. Per-episode cost prediction correlates only 0.46-0.62 with
+    # reality, but the batch-level multiple barely moves between splits:
+    # ax31 2.1020 -> 2.1550 (+2.5%), axk1 23.795 -> 23.150 (+2.7%). And s_m is
+    # a normalized share, so an error in the overall level of predicted light
+    # cost cancels out of it.
+    #
+    # Bounding with a deliberately loose rho (MODEL_MULTIPLE_BOUND) therefore
+    # gives a constraint that holds unless the batch multiple exceeds a value
+    # far outside anything observed -- unlike safety_ratio and high_cap_ratio,
+    # which both inherit the per-episode prediction's error.
+    light_share = pred_costs[:, 0] / light_total
+    excess_allowed = budget_multiplier - 1.0
+
     def choose(penalty):
         ev = pred_scores - penalty * risk_multiplier[None, :] * pred_rank_costs / rank_light_total
         choice = np.argmax(ev, axis=1)
         total = pred_costs[np.arange(len(choice)), choice].sum()
         high_total = pred_costs[choice == 2, 2].sum()
-        return choice, total, high_total
+        bound_excess = sum(
+            (MODEL_MULTIPLE_BOUND[m] - 1.0) * light_share[choice == m].sum()
+            for m in (1, 2)
+        )
+        return choice, total, high_total, bound_excess
 
-    def violates(total, high_total):
-        return total > cap or high_total > high_cap
+    def violates(total, high_total, bound_excess):
+        return (
+            total > cap
+            or high_total > high_cap
+            or bound_excess > excess_allowed * share_ratio
+        )
 
-    choice, total, high_total = choose(0.0)
-    if violates(total, high_total):
+    choice, total, high_total, bound_excess = choose(0.0)
+    if violates(total, high_total, bound_excess):
         low, high = 0.0, 1.0
-        choice, total, high_total = choose(high)
-        while violates(total, high_total) and high < 2.0 ** 40:
+        choice, total, high_total, bound_excess = choose(high)
+        while violates(total, high_total, bound_excess) and high < 2.0 ** 40:
             low, high = high, high * 2.0
-            choice, total, high_total = choose(high)
+            choice, total, high_total, bound_excess = choose(high)
         for _ in range(iterations):
             middle = (low + high) / 2.0
-            c, t, h = choose(middle)
-            if not violates(t, h):
+            c, t, h, b = choose(middle)
+            if not violates(t, h, b):
                 high = middle
-                choice, total, high_total = c, t, h
+                choice, total, high_total, bound_excess = c, t, h, b
             else:
                 low = middle
-    if violates(total, high_total):
+    if violates(total, high_total, bound_excess):
         choice = np.zeros(len(pred_scores), dtype=int)
     return choice
 
 
 def bootstrap(splits, *, budget_multiplier, safety_ratio, risk_multiplier,
-              high_cap_ratio, rng, k=BOOTSTRAP_K):
+              high_cap_ratio, share_ratio=1.0, rng, k=BOOTSTRAP_K):
     """Worst overrun probability across splits, mean score across splits."""
     worst = 0.0
     scores = []
@@ -118,6 +167,7 @@ def bootstrap(splits, *, budget_multiplier, safety_ratio, risk_multiplier,
                 safety_ratio=safety_ratio,
                 risk_multiplier=risk_multiplier,
                 high_cap_ratio=high_cap_ratio,
+                share_ratio=share_ratio,
             )
             real_total = rc[idx, choice].sum()
             limit = rc[idx, 0].sum() * budget_multiplier
@@ -221,6 +271,7 @@ def main(argv=None) -> int:
     if partial:
         for tier in args.tiers:
             best[tier]["high_cap_ratio"] = 1.0
+            best[tier]["share_ratio"] = 1.0
             b = best[tier]
             print(
                 f"{tier:9} (부분 탐색) risk[ax31]={b['risk_mid']:.2f} "
@@ -247,9 +298,27 @@ def main(argv=None) -> int:
                 chosen = high_cap_ratio
                 break
         b["high_cap_ratio"] = chosen
+
+        # Then tighten the share-based bound the same way. This one is the
+        # prediction-independent guarantee, so it is worth more than the
+        # per-episode caps above -- take the strictest value that still holds
+        # the score.
+        chosen_share = 1.0
+        for share_ratio in sorted(SHARE_RATIO_GRID):
+            overrun, score = bootstrap(
+                splits, budget_multiplier=budget_multipliers[tier],
+                safety_ratio=b["safety_ratio"], risk_multiplier=risk_multiplier,
+                high_cap_ratio=chosen, share_ratio=share_ratio, rng=rng,
+            )
+            if overrun <= OVERRUN_TARGET and score >= b["score"] - SCORE_TOLERANCE:
+                chosen_share = share_ratio
+                break
+        b["share_ratio"] = chosen_share
+
         print(
             f"{tier:9} risk[ax31]={b['risk_mid']:.2f} risk[axk1]={b['risk_high']:.2f} "
             f"safety={b['safety_ratio']:.2f} high_cap={chosen:.2f} "
+            f"share={chosen_share:.2f} "
             f"최악초과율={b['overrun']:.3f} 점수={b['score']:.4f}"
         )
 

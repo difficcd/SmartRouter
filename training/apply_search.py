@@ -53,6 +53,7 @@ def main(argv=None) -> int:
             f"{tier:9} risk[ax31]={entry['risk_mid']:.2f} "
             f"risk[axk1]={entry['risk_high']:.2f} safety={entry['safety_ratio']:.2f} "
             f"high_cap={entry['high_cap_ratio']:.2f} "
+            f"share={entry.get('share_ratio', 1.0):.2f} "
             f"최악초과율={entry['overrun']:.3f} 점수={entry['score']:.4f}"
         )
 
@@ -67,6 +68,7 @@ def main(argv=None) -> int:
         for t in TIERS
     }
     artifact["high_cap_ratio"] = {t: merged[t]["high_cap_ratio"] for t in TIERS}
+    artifact["share_ratio"] = {t: merged[t].get("share_ratio", 1.0) for t in TIERS}
 
     out = args.out or args.artifact
     out.parent.mkdir(parents=True, exist_ok=True)
