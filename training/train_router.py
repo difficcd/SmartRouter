@@ -142,6 +142,36 @@ def select_alpha_single(matrix, targets, *, folds: int, candidates: Sequence[flo
     return best_alpha
 
 
+def select_cost_alpha(matrix, targets, *, folds: int, candidates: Sequence[float]) -> float:
+    """Like select_alpha_single, but scores candidates in REAL cost space
+    (exp of the log-cost target) instead of log space.
+
+    The router and the official grader both work in real cost -- the budget
+    check is a sum of real credits. Picking alpha by log-space MSE optimizes
+    a quantity nobody uses: measured in real space, log-optimal alpha=1000
+    gives per-episode correlation 0.56/0.60/0.18 (light/ax31/axk1), while
+    alpha=1e4 gives 0.62/0.65/0.22 with lower real-space error too. Better
+    real-space cost accuracy is the binding constraint on how much budget a
+    tier can safely spend, so this is measured where it matters.
+
+    Each candidate's predictions are batch-calibrated before scoring (the
+    same correction main() applies), so candidates are compared on shape
+    rather than on level.
+    """
+    real = np.exp(targets)
+    best_alpha = candidates[0]
+    best_error = math.inf
+    for alpha in candidates:
+        predictions = np.exp(oof_predictions(matrix, targets, folds=folds, alpha=alpha))
+        predictions = predictions * (real.sum(axis=0) / predictions.sum(axis=0))
+        error = float(np.mean((predictions - real) ** 2))
+        print(f"  [cost ] alpha={alpha:>10.4g}  real-space mse={error:.6e}")
+        if error < best_error:
+            best_error = error
+            best_alpha = alpha
+    return best_alpha
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--train-input", type=Path, required=True)
@@ -165,17 +195,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates = [10.0**exponent for exponent in range(-1, 7)]
     print("alpha 후보 탐색 -- score와 cost를 따로 고른다 (out-of-fold, 5-fold):")
     score_alpha = select_alpha_single(matrix, score_targets, folds=5, candidates=candidates, label="score")
-    cost_alpha = select_alpha_single(matrix, cost_targets, folds=5, candidates=candidates, label="cost ")
+    # cost는 실제(exp) 스케일에서 고른다 -- 예산 검사가 사는 공간이 거기다.
+    cost_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
     print(f"선택된 alpha: score={score_alpha:g}  cost={cost_alpha:g}")
 
     # exp()로 log-cost를 원래 스케일로 되돌리면 Jensen 부등식 때문에 구조적으로
-    # 과소추정된다(E[exp(residual)] > exp(E[residual]) = 1, residual이 정확히
-    # 0으로 안 맞아떨어지는 한). Duan(1983) smearing estimator: 재학습 없이
-    # out-of-fold 잔차의 exp() 평균을 모델별로 곱해서 이 편향을 보정한다.
+    # 과소추정된다. v1은 Duan(1983) smearing(잔차 exp()의 문항별 평균)으로 이걸
+    # 보정했는데, 실측해보니 그 보정이 배치 합계 기준으로는 크게 과보정이었다
+    # (Train에서 예측합/실제합이 light 1.35, ax31 1.24, axk1 1.13).
+    #
+    # 중요한 건 문항별 기댓값이 아니라 배치 합계다 -- 라우터의 cap도, 공식
+    # 채점의 예산 검사도 전부 "이 배치 전체 비용의 합"만 본다. 합이 부풀려지면
+    # 안전계수를 과도하게 조여야 하고(fast는 1.25배 예산 중 실제로 1.025배만
+    # 쓰게 됐다), 그만큼 승격 여지를 통째로 날린다.
+    #
+    # 그래서 보정계수를 "out-of-fold 예측 합이 실제 합과 일치하도록" 직접
+    # 잡는다. Duan smearing이 문항별 불편추정을 노린다면 이건 배치합 불편추정을
+    # 노리는 것 -- 우리 목적함수에 정확히 맞는 쪽.
     cost_oof = oof_predictions(matrix, cost_targets, folds=5, alpha=cost_alpha)
-    cost_smear = np.exp(cost_targets - cost_oof).mean(axis=0)
+    cost_smear = np.exp(cost_targets).sum(axis=0) / np.exp(cost_oof).sum(axis=0)
     print(
-        "cost smearing 보정계수(모델별, out-of-fold): "
+        "cost 배치합 보정계수(모델별, out-of-fold): "
         + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_smear))
     )
 
