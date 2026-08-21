@@ -33,13 +33,15 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
+    # A tier may arrive in several pieces when its risk_high grid was split
+    # across machines (search_standalone.py --risk-high). Keep the best-scoring
+    # entry per tier; identical tiers from a full search simply agree.
     merged = {}
     for path in args.results:
         chunk = json.loads(path.read_text(encoding="utf-8"))
-        overlap = set(chunk) & set(merged)
-        if overlap:
-            raise SystemExit(f"등급이 중복 지정됨: {sorted(overlap)} ({path})")
-        merged.update(chunk)
+        for tier, entry in chunk.items():
+            if tier not in merged or entry["score"] > merged[tier]["score"]:
+                merged[tier] = entry
 
     missing = [tier for tier in TIERS if tier not in merged]
     if missing:

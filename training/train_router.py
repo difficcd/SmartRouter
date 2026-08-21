@@ -177,6 +177,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train-input", type=Path, required=True)
     parser.add_argument("--train-outcomes", type=Path, required=True)
     parser.add_argument("--hash-bins", type=int, default=256)
+    parser.add_argument(
+        "--cost-fit",
+        choices=("split", "classic"),
+        default="split",
+        help="split: 예산용/랭킹용 alpha를 따로 + 배치합 보정 (v10/v11). "
+             "classic: 하나의 log-MSE alpha + Duan smearing (v8).",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -212,12 +219,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 1e5 -> 0.6213. Meanwhile real-space error keeps improving all the way
     # to 1e5. v10 used the real-space alpha for both and won premium (budget
     # bound) while losing fast (ranking bound); splitting them takes both.
-    cost_budget_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
-    cost_rank_alpha = select_alpha_single(
-        matrix, cost_targets, folds=5, candidates=candidates, label="c-rank"
-    )
+    #
+    # --cost-fit selects between the two families measured so far:
+    #   split   (v10/v11) -- budget head by real-space error, ranking head by
+    #                        log MSE, batch-sum level correction on each.
+    #   classic (v8)      -- one alpha by log MSE for both heads, Duan
+    #                        per-episode smearing. Both heads identical, which
+    #                        is exactly the single-head model v8 shipped.
+    # v8 still scores higher than v11/v12 on BOTH public splits, so "split"
+    # is not established as better once safety is calibrated properly; this
+    # flag exists to compare them under identical calibration.
+    if args.cost_fit == "split":
+        cost_budget_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
+        cost_rank_alpha = select_alpha_single(
+            matrix, cost_targets, folds=5, candidates=candidates, label="c-rank"
+        )
+    else:
+        cost_budget_alpha = select_alpha_single(
+            matrix, cost_targets, folds=5, candidates=candidates, label="cost "
+        )
+        cost_rank_alpha = cost_budget_alpha
     print(
-        f"선택된 alpha: score={score_alpha:g}  "
+        f"선택된 alpha({args.cost_fit}): score={score_alpha:g}  "
         f"cost(예산)={cost_budget_alpha:g}  cost(랭킹)={cost_rank_alpha:g}"
     )
 
@@ -234,14 +257,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 그래서 보정계수를 "out-of-fold 예측 합이 실제 합과 일치하도록" 직접
     # 잡는다. Duan smearing이 문항별 불편추정을 노린다면 이건 배치합 불편추정을
     # 노리는 것 -- 우리 목적함수에 정확히 맞는 쪽.
-    # Both cost models get their own batch-sum correction, since each one's
-    # raw exp() level is off by a different amount.
-    def batch_correction(alpha):
+    # Each head gets its own level correction, since each one's raw exp()
+    # level is off by a different amount.
+    def level_correction(alpha):
         oof = oof_predictions(matrix, cost_targets, folds=5, alpha=alpha)
-        return np.exp(cost_targets).sum(axis=0) / np.exp(oof).sum(axis=0)
+        if args.cost_fit == "split":
+            return np.exp(cost_targets).sum(axis=0) / np.exp(oof).sum(axis=0)
+        return np.exp(cost_targets - oof).mean(axis=0)  # Duan smearing (v8)
 
-    cost_smear = batch_correction(cost_budget_alpha)
-    cost_rank_smear = batch_correction(cost_rank_alpha)
+    cost_smear = level_correction(cost_budget_alpha)
+    cost_rank_smear = (
+        cost_smear if cost_rank_alpha == cost_budget_alpha
+        else level_correction(cost_rank_alpha)
+    )
     print(
         "cost 배치합 보정계수 -- 예산용: "
         + "  ".join(f"{m}={s:.4f}" for m, s in zip(MODEL_IDS, cost_smear))
