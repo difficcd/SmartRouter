@@ -2598,17 +2598,17 @@ _TEAM_ARTIFACT_JSON = r'''
     "balanced": {
       "ax31": 2.5,
       "ax31-light": 1.0,
-      "axk1-think": 2.0
+      "axk1-think": 6.0
     },
     "fast": {
-      "ax31": 2.5,
+      "ax31": 3.0,
       "ax31-light": 1.0,
       "axk1-think": 5.0
     },
     "premium": {
-      "ax31": 2.5,
+      "ax31": 1.2,
       "ax31-light": 1.0,
-      "axk1-think": 4.0
+      "axk1-think": 2.5
     }
   },
   "schema_version": 1,
@@ -3427,10 +3427,15 @@ _TEAM_ARTIFACT_JSON = r'''
       "intercept": 0.8116477272727273
     }
   },
+  "share_ratio": {
+    "balanced": 1.0,
+    "fast": 0.9,
+    "premium": 1.0
+  },
   "tier_safety_ratios": {
-    "balanced": 0.8,
-    "fast": 0.84,
-    "premium": 0.6
+    "balanced": 0.7,
+    "fast": 0.15,
+    "premium": 0.55
   }
 }
 '''
