@@ -7,7 +7,13 @@
 # arrived from the baseline as CRLF and is internally consistent, so it stays
 # that way. Converting it would add ~3700 lines of whitespace-only churn to the
 # one file a reviewer most needs to read.
+#
+# It is marked -text rather than "text eol=crlf" on purpose. The latter asks git
+# to store an LF blob and hand out CRLF, which would mean renormalizing the
+# committed blob -- the very churn we are avoiding -- and until that happened
+# the file showed as permanently modified. -text tells git to leave the bytes
+# alone in both directions, so the tree stays clean.
 * text=auto eol=lf
-src/ossp_router/heuristic.py text eol=crlf
+src/ossp_router/heuristic.py -text
 *.npz binary
 *.png binary
