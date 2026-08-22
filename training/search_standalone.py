@@ -30,7 +30,12 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 RNG_SEED = 20260815
-BOOTSTRAP_K = 300
+# k=300 resolves the overrun probability only to 1/300 = 0.33%, so a 0.5%
+# target degenerates into "at most one overrun in 300" -- mostly noise. v16
+# tightens the target, so it needs the resolution to go with it: at k=1000 a
+# 0.5% target is "at most 5 in 1000", and the Clopper-Pearson bound used by
+# finalize_search.py's ucb rule becomes tight enough to be worth applying.
+BOOTSTRAP_K = 1000
 OVERRUN_TARGET = 0.01
 # How much bootstrap score we will pay to buy a hard axk1 ceiling. At
 # 0.001 the search never found a binding cap (v13 chose 1.0 = no cap for
@@ -151,10 +156,18 @@ def allocate(pred_scores, pred_costs, pred_rank_costs, *, budget_multiplier,
 
 
 def bootstrap(splits, *, budget_multiplier, safety_ratio, risk_multiplier,
-              high_cap_ratio, share_ratio=1.0, rng, k=BOOTSTRAP_K):
-    """Worst overrun probability across splits, mean score across splits."""
+              high_cap_ratio, share_ratio=1.0, rng, k=BOOTSTRAP_K,
+              with_counts=False):
+    """Worst overrun probability across splits, mean score across splits.
+
+    with_counts additionally returns the raw (overruns, k) per split. The
+    counts are what makes a confidence bound possible later: selecting the
+    best of thousands of noisy overrun estimates favours the ones that got
+    lucky, and a point estimate cannot express that. See finalize_search.py.
+    """
     worst = 0.0
     scores = []
+    counts = []
     for ps, pc, prc, rs, rc in splits:
         n = len(ps)
         overruns = 0
@@ -177,6 +190,9 @@ def bootstrap(splits, *, budget_multiplier, safety_ratio, risk_multiplier,
                 total_score += float(rs[idx, choice].mean())
         worst = max(worst, overruns / k)
         scores.append(total_score / k)
+        counts.append(overruns)
+    if with_counts:
+        return worst, float(np.mean(scores)), counts, k
     return worst, float(np.mean(scores))
 
 
@@ -189,24 +205,44 @@ def _init(splits):
 
 
 def _task(job):
+    """Bootstrap the whole SAFETY_GRID and return the full curve.
+
+    The expensive part -- k=300 resamples per (risk, safety) point -- does not
+    depend on OVERRUN_TARGET at all; the target only decides which already
+    computed point gets picked. Returning the curve instead of one winner
+    therefore lets any target be evaluated afterwards for free, which is how
+    v16 compares 1.0% / 0.5% / 0.3% off a single search.
+    """
     tier, budget_multiplier, risk_mid, risk_high = job
     rng = np.random.default_rng(
         (RNG_SEED, TIER_ORDER.index(tier), int(risk_mid * 100), int(risk_high * 100))
     )
     risk_multiplier = np.array([1.0, risk_mid, risk_high])
-    best = None
-    fallback = None
+    curve = []
     for safety_ratio in SAFETY_GRID:
-        overrun, score = bootstrap(
+        overrun, score, counts, k = bootstrap(
             _SPLITS, budget_multiplier=budget_multiplier, safety_ratio=safety_ratio,
             risk_multiplier=risk_multiplier, high_cap_ratio=1.0, rng=rng,
+            with_counts=True,
         )
-        if fallback is None or overrun < fallback[2]:
-            fallback = (score, safety_ratio, overrun)
-        if overrun <= OVERRUN_TARGET and (best is None or score > best[0]):
-            best = (score, safety_ratio, overrun)
-    score, safety_ratio, overrun = best if best is not None else fallback
-    return tier, risk_mid, risk_high, safety_ratio, overrun, score
+        curve.append([safety_ratio, overrun, score, counts, k])
+    return tier, risk_mid, risk_high, curve
+
+
+def pick_from_curve(curve, overrun_target, measure=None):
+    """Highest-scoring safety_ratio meeting the target; else the safest one.
+
+    measure(row) -> overrun figure to test against the target. The default is
+    the raw bootstrap frequency; finalize_search.py passes a confidence bound
+    instead. Returns (safety_ratio, measured_overrun, score).
+    """
+    if measure is None:
+        measure = lambda row: row[1]  # noqa: E731
+    scored = [(row[0], measure(row), row[2]) for row in curve]
+    ok = [row for row in scored if row[1] <= overrun_target]
+    if ok:
+        return max(ok, key=lambda row: row[2])
+    return min(scored, key=lambda row: row[1])
 
 
 def load_splits(path):
@@ -229,6 +265,16 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--overrun-target", type=float, default=OVERRUN_TARGET,
+        help="이 부트스트랩 초과확률 이하에서 점수 최대화 (기본 %(default)s).",
+    )
+    parser.add_argument(
+        "--curve-out", default=None,
+        help="safety_ratio 전 구간의 (초과확률, 점수) 곡선을 저장한다. "
+             "탐색 비용은 목표값과 무관하므로, 이걸 남겨두면 다른 목표값을 "
+             "재계산 없이 finalize_search.py로 고를 수 있다.",
+    )
     args = parser.parse_args(argv)
 
     splits, data = load_splits(args.matrices)
@@ -249,18 +295,31 @@ def main(argv=None) -> int:
     print(f"Dev {len(splits[0][0])}문항 / Train {len(splits[1][0])}문항, 두 split 모두 안전해야 채택\n")
 
     best = {}
+    curves = []
     done = 0
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init,
                              initargs=(splits,)) as pool:
-        for tier, risk_mid, risk_high, safety, overrun, score in pool.map(_task, jobs):
+        for tier, risk_mid, risk_high, curve in pool.map(_task, jobs):
             done += 1
             if done % 12 == 0:
                 print(f"  ... {done}/{len(jobs)}", flush=True)
+            curves.append({
+                "tier": tier, "risk_mid": risk_mid, "risk_high": risk_high,
+                "curve": curve,
+            })
+            safety, overrun, score = pick_from_curve(curve, args.overrun_target)
             if tier not in best or score > best[tier]["score"]:
                 best[tier] = {
                     "risk_mid": risk_mid, "risk_high": risk_high,
                     "safety_ratio": safety, "overrun": overrun, "score": score,
                 }
+
+    if args.curve_out:
+        with open(args.curve_out, "w", encoding="utf-8") as handle:
+            json.dump({"overrun_target": args.overrun_target,
+                       "budget_multipliers": budget_multipliers,
+                       "rows": curves}, handle, ensure_ascii=False)
+        print(f"곡선 저장: {args.curve_out}")
 
     # Tighten the hard axk1 cap where it's free, now that the rest is fixed.
     # Only meaningful once a tier's whole grid has been seen -- with a partial
@@ -294,7 +353,7 @@ def main(argv=None) -> int:
                 safety_ratio=b["safety_ratio"], risk_multiplier=risk_multiplier,
                 high_cap_ratio=high_cap_ratio, rng=rng,
             )
-            if overrun <= OVERRUN_TARGET and score >= b["score"] - SCORE_TOLERANCE:
+            if overrun <= args.overrun_target and score >= b["score"] - SCORE_TOLERANCE:
                 chosen = high_cap_ratio
                 break
         b["high_cap_ratio"] = chosen
@@ -310,7 +369,7 @@ def main(argv=None) -> int:
                 safety_ratio=b["safety_ratio"], risk_multiplier=risk_multiplier,
                 high_cap_ratio=chosen, share_ratio=share_ratio, rng=rng,
             )
-            if overrun <= OVERRUN_TARGET and score >= b["score"] - SCORE_TOLERANCE:
+            if overrun <= args.overrun_target and score >= b["score"] - SCORE_TOLERANCE:
                 chosen_share = share_ratio
                 break
         b["share_ratio"] = chosen_share
