@@ -1,0 +1,13 @@
+# Line endings are pinned here because they drifted once already: this repo is
+# developed on Windows, and training/train_router.py and calibrate_safety.py --
+# shipped by the baseline as LF -- came back as CRLF, which turned a 138-line
+# change into a 568-line diff for anyone reviewing it.
+#
+# Everything is LF, with one deliberate exception: src/ossp_router/heuristic.py
+# arrived from the baseline as CRLF and is internally consistent, so it stays
+# that way. Converting it would add ~3700 lines of whitespace-only churn to the
+# one file a reviewer most needs to read.
+* text=auto eol=lf
+src/ossp_router/heuristic.py text eol=crlf
+*.npz binary
+*.png binary
