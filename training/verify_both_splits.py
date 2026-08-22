@@ -100,6 +100,22 @@ def main() -> int:
         limit = float(reports["dev"]["tiers"][tier]["budget_multiplier"])
         print(f"  {tier:9} 한도={limit:.2f}  {ratios}")
 
+    # Score alone does not say whether a version is safe to ship: a higher
+    # number bought by spending closer to the limit can be strictly worse once
+    # the hidden split shifts. So report the margin in the unit that matters --
+    # how many times the observed Dev->Train shift it can absorb. hash_regex
+    # died at 0.07x (0.4% margin against a 5.4% shift); under ~2x deserves a
+    # second look.
+    print("\n안전 여유 (현재 사용량 대비):")
+    for tier in TIERS:
+        r = {sp: float(reports[sp]["tiers"][tier]["budget_ratio"]) for sp in SPLITS}
+        limit = float(reports["dev"]["tiers"][tier]["budget_multiplier"])
+        worst = max(r.values())
+        margin = (limit - worst) / worst
+        shift = abs(r["train"] - r["dev"]) / r["dev"]
+        cover = margin / shift if shift > 1e-9 else float("inf")
+        print(f"  {tier:9} 여유={margin:6.1%}  split간 변동={shift:5.1%}  -> 관측 변동의 {cover:5.1f}배 버팀")
+
     if any_failed:
         print("\n!! 한 split 이상에서 예산 초과 -- 해당 등급은 0점 처리된다.")
         return 1

@@ -331,6 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tier: {model_id: 1.0 for model_id in MODEL_IDS} for tier in TIERS
         },
         "high_cap_ratio": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
+        "share_ratio": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

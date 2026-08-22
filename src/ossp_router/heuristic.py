@@ -378,6 +378,7 @@ class _TeamArtifact:
         "tier_safety_ratios",
         "risk_multiplier",
         "high_cap_ratio",
+        "share_ratio",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -2595,19 +2596,19 @@ _TEAM_ARTIFACT_JSON = r'''
   "policy_sha256": "7c892c423da5fa762e7e1a93b9fa071be51e259b65d2b63a5ba434c4342d7a8e",
   "risk_multiplier": {
     "balanced": {
-      "ax31": 2.5,
+      "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 2.0
+      "axk1-think": 2.5
     },
     "fast": {
-      "ax31": 2.5,
+      "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 5.0
+      "axk1-think": 1.5
     },
     "premium": {
-      "ax31": 2.5,
+      "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 4.0
+      "axk1-think": 6.0
     }
   },
   "schema_version": 1,
@@ -3426,10 +3427,15 @@ _TEAM_ARTIFACT_JSON = r'''
       "intercept": 0.8116477272727273
     }
   },
+  "share_ratio": {
+    "balanced": 1.0,
+    "fast": 1.0,
+    "premium": 0.8
+  },
   "tier_safety_ratios": {
-    "balanced": 0.8,
-    "fast": 0.84,
-    "premium": 0.6
+    "balanced": 1.0,
+    "fast": 0.05,
+    "premium": 0.55
   }
 }
 '''
@@ -3466,6 +3472,7 @@ def _team_parse_artifact(text: str) -> _TeamArtifact:
             for t in TIERS
         },
         high_cap_ratio={t: float(value["high_cap_ratio"][t]) for t in TIERS},
+        share_ratio={t: float(value["share_ratio"][t]) for t in TIERS},
     )
 
 
@@ -3519,6 +3526,17 @@ def _team_predict_episode(
     return scores, costs, rank_costs
 
 
+# Deliberately loose upper bounds on each model's batch-level cost multiple
+# relative to ax31-light. Measured on the public data: ax31 2.1020 (Dev) /
+# 2.1550 (Train), axk1-think 23.795 / 23.150. These sit ~40% above the larger
+# observation, so the share-based constraint in _team_select_models stays valid
+# across a distribution shift many times larger than the public splits show.
+_TEAM_MULTIPLE_BOUND = {
+    _TEAM_MODEL_IDS[1]: 3.0,
+    _TEAM_MODEL_IDS[2]: 33.0,
+}
+
+
 # ---- allocate: batch-level λ-bisection with per-model risk multiplier ------
 
 
@@ -3531,6 +3549,7 @@ def _team_select_models(
     safety_ratio: float,
     risk_multiplier: _TeamMapping[str, float],
     high_cap_ratio: float = 1.0,
+    share_ratio: float = 1.0,
 ) -> _TeamTuple[str, ...]:
     # predicted_costs feeds the budget (cap, totals); predicted_rank_costs
     # feeds the EV comparison. Same quantity, two fits -- see train_router.py.
@@ -3538,7 +3557,21 @@ def _team_select_models(
     rank_light_total = _team_math.fsum(
         row[_TEAM_MODEL_IDS[0]] for row in predicted_rank_costs
     )
-    cap = light_total * max(1.0, budget_multiplier * safety_ratio)
+    # safety_ratio scales the ALLOWED EXCESS, not the whole multiplier.
+    #
+    # The old form (light_total * max(1.0, budget_multiplier * safety_ratio))
+    # made safety_ratio mean wildly different things per tier: premium's 4.0x
+    # budget at safety 0.7 still allowed 2.8x, but fast's 1.25x at safety 0.7
+    # hit the max(1.0, ...) floor and allowed no promotion at all. Every
+    # safety_ratio below 0.80 was the same dead value for fast, and 0.84 --
+    # the value the search kept picking -- bought only 5% of the 25% it was
+    # allowed to spend.
+    #
+    # Reading it as a fraction of the excess makes the parameter mean the same
+    # thing everywhere ("spend this share of what the tier may spend beyond
+    # all-light") and gives fast the same search resolution the other tiers
+    # already had.
+    cap = light_total * (1.0 + (budget_multiplier - 1.0) * safety_ratio)
     # risk_multiplier only discourages the most expensive model in proportion to
     # how much we (think we) trust its cost prediction -- if that prediction is
     # simply wrong (the exact hash_regex failure mode), no amount of discouraging
@@ -3549,7 +3582,27 @@ def _team_select_models(
     high_model = _TEAM_MODEL_IDS[-1]
     high_cap = cap * high_cap_ratio
 
-    def choose(penalty: float) -> _TeamTuple[_TeamTuple[str, ...], float, float]:
+    # Share-based hard constraint. The budget check is really
+    #     ratio = 1 + sum_promoted(c_m(i) - c_light(i)) / L
+    # which, grouped by model, is
+    #     ratio = 1 + sum_m (rho_m - 1) * s_m
+    # with s_m the share of the batch's LIGHT cost held by episodes promoted to
+    # m, and rho_m that model's batch-level cost multiple.
+    #
+    # Everything above (safety_ratio, high_cap_ratio) inherits the per-episode
+    # cost prediction's error, which correlates only 0.46-0.62 with reality.
+    # This constraint does not: s_m is a normalized share, so an error in the
+    # overall level of predicted light cost cancels out, and rho_m barely moves
+    # between splits (ax31 2.1020 -> 2.1550, axk1 23.795 -> 23.150, both under
+    # 3%). Bounding rho by _TEAM_MULTIPLE_BOUND -- set ~40% above the larger
+    # observation -- makes the constraint hold through a distribution shift far
+    # bigger than anything the public data shows.
+    light_share = [
+        row[_TEAM_MODEL_IDS[0]] / light_total for row in predicted_costs
+    ]
+    bound_excess_allowed = (budget_multiplier - 1.0) * share_ratio
+
+    def choose(penalty: float) -> _TeamTuple[_TeamTuple[str, ...], float, float, float]:
         selected = []
         for scores, rank_costs in zip(predicted_scores, predicted_rank_costs):
             model_id = max(
@@ -3572,27 +3625,36 @@ def _team_select_models(
             for costs, model_id in zip(predicted_costs, selected)
             if model_id == high_model
         )
-        return tuple(selected), total, high_total
+        bound_excess = _team_math.fsum(
+            (_TEAM_MULTIPLE_BOUND[model_id] - 1.0) * share
+            for share, model_id in zip(light_share, selected)
+            if model_id != _TEAM_MODEL_IDS[0]
+        )
+        return tuple(selected), total, high_total, bound_excess
 
-    def violates(total: float, high_total: float) -> bool:
-        return total > cap or high_total > high_cap
+    def violates(total: float, high_total: float, bound_excess: float) -> bool:
+        return (
+            total > cap
+            or high_total > high_cap
+            or bound_excess > bound_excess_allowed
+        )
 
-    selected, total, high_total = choose(0.0)
-    if violates(total, high_total):
+    selected, total, high_total, bound_excess = choose(0.0)
+    if violates(total, high_total, bound_excess):
         low, high = 0.0, 1.0
-        selected, total, high_total = choose(high)
-        while violates(total, high_total) and high < 2.0**40:
+        selected, total, high_total, bound_excess = choose(high)
+        while violates(total, high_total, bound_excess) and high < 2.0**40:
             low, high = high, high * 2.0
-            selected, total, high_total = choose(high)
+            selected, total, high_total, bound_excess = choose(high)
         for _iteration in range(40):
             middle = (low + high) / 2.0
-            candidate_selected, candidate_total, candidate_high_total = choose(middle)
-            if not violates(candidate_total, candidate_high_total):
+            candidate = choose(middle)
+            if not violates(candidate[1], candidate[2], candidate[3]):
                 high = middle
-                selected, total, high_total = candidate_selected, candidate_total, candidate_high_total
+                selected, total, high_total, bound_excess = candidate
             else:
                 low = middle
-    if violates(total, high_total):
+    if violates(total, high_total, bound_excess):
         selected = tuple(_TEAM_MODEL_IDS[0] for _row in predicted_scores)
 
     return selected
@@ -3631,6 +3693,7 @@ def team_router_make_submission(
         safety_ratio=artifact.tier_safety_ratios[tier],
         risk_multiplier=artifact.risk_multiplier[tier],
         high_cap_ratio=artifact.high_cap_ratio[tier],
+        share_ratio=artifact.share_ratio[tier],
     )
 
     submission = Submission(
