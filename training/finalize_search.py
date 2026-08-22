@@ -107,6 +107,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument(
+        "--score-tolerance", type=float, default=SCORE_TOLERANCE,
+        help="high_cap/share 정밀화가 내줘도 되는 부트스트랩 점수 (기본 %(default)s). "
+             "두 단계에 각각 적용되므로 실제 손실은 최대 2배가 될 수 있다. v16 실측: "
+             "0.006으로 두자 fast가 한도를 다 써서 실측 점수를 0.014 잃었다 -- "
+             "정밀화는 공짜일 때만 걸어야 하는 백스톱이므로 작게 잡는 편이 맞다.",
+    )
+    parser.add_argument(
         "--skip-refine", action="store_true",
         help="high_cap/share 정밀화를 건너뛰고 1.0으로 둔다 (빠른 비교용).",
     )
@@ -136,7 +143,11 @@ def main(argv=None) -> int:
         raise SystemExit(f"곡선에 없는 등급: {missing}")
 
     splits, _ = load_splits(args.matrices)
-    print(f"초과확률 목표 {args.overrun_target:.3%}  ({len(rows)}개 조합의 곡선에서 선택)\n")
+    rule_note = "Clopper-Pearson 상한" if args.rule == "ucb" else "부트스트랩 빈도"
+    if args.rule == "ucb":
+        rule_note += f", alpha={args.alpha}"
+    print(f"초과확률 목표 {args.overrun_target:.3%} 판정={rule_note}  "
+          f"({len(rows)}개 조합의 곡선에서 선택)\n")
 
     for tier in TIER_ORDER:
         b = best[tier]
@@ -158,13 +169,13 @@ def main(argv=None) -> int:
 
             for high_cap_ratio in sorted(HIGH_CAP_GRID):
                 overrun, score = judged(high_cap_ratio=high_cap_ratio)
-                if overrun <= args.overrun_target and score >= b["score"] - SCORE_TOLERANCE:
+                if overrun <= args.overrun_target and score >= b["score"] - args.score_tolerance:
                     b["high_cap_ratio"] = high_cap_ratio
                     break
             for share_ratio in sorted(SHARE_RATIO_GRID):
                 overrun, score = judged(
                     high_cap_ratio=b["high_cap_ratio"], share_ratio=share_ratio)
-                if overrun <= args.overrun_target and score >= b["score"] - SCORE_TOLERANCE:
+                if overrun <= args.overrun_target and score >= b["score"] - args.score_tolerance:
                     b["share_ratio"] = share_ratio
                     break
         print(
