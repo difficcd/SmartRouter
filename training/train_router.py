@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from ossp_router.heuristic import (  # noqa: E402
     _TEAM_DENSE_FEATURE_NAMES,
     _team_raw_feature_vector,
+    episode_text,
 )
 from ossp_router.protocol import (  # noqa: E402
     MODEL_IDS,
@@ -83,12 +84,21 @@ def build_training_matrix(
         dtype=np.float64,
     )
     targets = []
+    tokens = []
+    characters = []
     for episode in inputs.episodes:
         rows = [outcome_index[(episode.episode_id, m)] for m in MODEL_IDS]
         scores = [float(row.score) for row in rows]
         log_costs = [math.log(_outcome_cost(row, policy)) for row in rows]
         targets.append(scores + log_costs)
-    return matrix, np.asarray(targets, dtype=np.float64)
+        # --cost-fit tokens needs the two halves of the cost separately, plus
+        # the prompt length the input half is computed from.
+        tokens.append([float(row.input_tokens) for row in rows]
+                      + [float(max(row.output_tokens, 1)) for row in rows])
+        characters.append(float(len(episode_text(episode))))
+    return (matrix, np.asarray(targets, dtype=np.float64),
+            np.asarray(tokens, dtype=np.float64),
+            np.asarray(characters, dtype=np.float64))
 
 
 def fit_ridge(matrix, targets, alpha: float):
@@ -179,10 +189,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--hash-bins", type=int, default=256)
     parser.add_argument(
         "--cost-fit",
-        choices=("split", "classic"),
+        choices=("split", "classic", "tokens"),
         default="split",
         help="split: 예산용/랭킹용 alpha를 따로 + 배치합 보정 (v10/v11). "
-             "classic: 하나의 log-MSE alpha + Duan smearing (v8).",
+             "classic: 하나의 log-MSE alpha + Duan smearing (v8). "
+             "tokens: 입력토큰은 문자 수로 계산하고 출력토큰만 회귀 (v18).",
     )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -192,12 +203,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     outcomes = load_outcomes(args.train_outcomes)
 
     print(f"학습 문항 수: {len(inputs.episodes)}  hash_bins={args.hash_bins}")
-    matrix, targets = build_training_matrix(inputs, outcomes, policy, args.hash_bins)
+    matrix, targets, tokens, characters = build_training_matrix(
+        inputs, outcomes, policy, args.hash_bins
+    )
     print(f"특징 행렬: {matrix.shape}  타깃: {targets.shape}")
 
     model_count = len(MODEL_IDS)
     score_targets = targets[:, :model_count]
     cost_targets = targets[:, model_count:]
+
+    # --cost-fit tokens: every model prices output at exactly 4x input, so
+    #     cost_m = input_rate_m * (input_tokens + 4 * output_tokens)
+    # and input_tokens is 99.7% determined by prompt length (R^2 0.9970 on
+    # Train) while making up 49.6% / 48.7% / 13.1% of each model's cost. The
+    # other two modes hand that half to the regression, which then carries its
+    # noise into a quantity we could have computed exactly. Here the head is
+    # fitted on log(output_tokens) alone and the input half is added back at
+    # inference from the character count.
+    unit = float(policy.token_unit)
+    rate_in = np.array([float(policy.models[m].input_token_rate) for m in MODEL_IDS]) / unit
+    rate_out = np.array([float(policy.models[m].output_token_rate) for m in MODEL_IDS]) / unit
+    input_tokens = tokens[:, :model_count]
+    output_tokens = tokens[:, model_count:]
+    design = np.vstack([characters, np.ones_like(characters)]).T
+    input_fit = np.linalg.lstsq(design, input_tokens, rcond=None)[0]  # (2, models)
+    if args.cost_fit == "tokens":
+        residual = input_tokens - design @ input_fit
+        print("입력토큰 = a*문자수 + b: "
+              + "  ".join(f"{m}: a={input_fit[0, i]:.5f} b={input_fit[1, i]:.1f} "
+                          f"잔차sd={residual[:, i].std():.0f}"
+                          for i, m in enumerate(MODEL_IDS)))
+        cost_targets = np.log(output_tokens)
 
     candidates = [10.0**exponent for exponent in range(-1, 7)]
     print("alpha 후보 탐색 -- score와 cost를 따로 고른다 (out-of-fold, 5-fold):")
@@ -229,7 +265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # v8 still scores higher than v11/v12 on BOTH public splits, so "split"
     # is not established as better once safety is calibrated properly; this
     # flag exists to compare them under identical calibration.
-    if args.cost_fit == "split":
+    if args.cost_fit in ("split", "tokens"):
         cost_budget_alpha = select_cost_alpha(matrix, cost_targets, folds=5, candidates=candidates)
         cost_rank_alpha = select_alpha_single(
             matrix, cost_targets, folds=5, candidates=candidates, label="c-rank"
@@ -261,7 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # level is off by a different amount.
     def level_correction(alpha):
         oof = oof_predictions(matrix, cost_targets, folds=5, alpha=alpha)
-        if args.cost_fit == "split":
+        if args.cost_fit in ("split", "tokens"):
             return np.exp(cost_targets).sum(axis=0) / np.exp(oof).sum(axis=0)
         return np.exp(cost_targets - oof).mean(axis=0)  # Duan smearing (v8)
 
@@ -324,6 +360,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "cost_rank_smear": {
             model_id: float(cost_rank_smear[i]) for i, model_id in enumerate(MODEL_IDS)
+        },
+        # "log_cost": the heads predict log(total cost) directly (split/classic).
+        # "tokens": they predict log(output_tokens), and the router adds the
+        # input half back from the character count -- see the --cost-fit note
+        # above. The router branches on this, so old artifacts keep working.
+        "cost_model": "tokens" if args.cost_fit == "tokens" else "log_cost",
+        "input_token_fit": {
+            model_id: [float(input_fit[0, i]), float(input_fit[1, i])]
+            for i, model_id in enumerate(MODEL_IDS)
+        },
+        "token_rates": {
+            model_id: [float(rate_in[i]), float(rate_out[i])]
+            for i, model_id in enumerate(MODEL_IDS)
         },
         "tier_safety_ratios": {tier: 1.0 for tier in TIERS},  # placeholder -- calibrate next
         # placeholder -- per-tier now, since fast/premium want opposite values
