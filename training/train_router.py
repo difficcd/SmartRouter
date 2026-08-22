@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ossp_router.heuristic import (  # noqa: E402
     _TEAM_DENSE_FEATURE_NAMES,
+    _team_expand_basis,
     _team_raw_feature_vector,
 )
 from ossp_router.protocol import (  # noqa: E402
@@ -68,7 +69,7 @@ def _outcome_cost(outcome, policy: RoutingPolicy) -> float:
 
 def build_training_matrix(
     inputs: InputBatch, outcomes: OutcomeBatch, policy: RoutingPolicy, hash_bins: int
-) -> Tuple[Any, Any]:
+) -> Tuple[Any, Any, Any, Any]:
     outcome_index = {(o.episode_id, o.model_id): o for o in outcomes.outcomes}
     expected = {
         (episode.episode_id, model_id)
@@ -78,8 +79,20 @@ def build_training_matrix(
     if set(outcome_index) != expected:
         raise ValueError("Train outcome 행렬이 입력과 모델 전체를 포함하지 않습니다.")
 
-    matrix = np.asarray(
+    raw = np.asarray(
         [_team_raw_feature_vector(episode, hash_bins) for episode in inputs.episodes],
+        dtype=np.float64,
+    )
+    # The trigonometric basis is standardized against Train's own dense block,
+    # and the router has to reproduce that exactly, so these two vectors ride
+    # along in the artifact. They are NOT the same as feature_mean/scale, which
+    # standardize the whole 326-wide matrix after expansion.
+    dense = len(_TEAM_DENSE_FEATURE_NAMES)
+    basis_mean = raw[:, :dense].mean(axis=0)
+    basis_scale = raw[:, :dense].std(axis=0)
+    basis_scale = np.where(basis_scale > 1e-12, basis_scale, 1.0)
+    matrix = np.asarray(
+        [_team_expand_basis(row, basis_mean, basis_scale) for row in raw],
         dtype=np.float64,
     )
     targets = []
@@ -88,7 +101,7 @@ def build_training_matrix(
         scores = [float(row.score) for row in rows]
         log_costs = [math.log(_outcome_cost(row, policy)) for row in rows]
         targets.append(scores + log_costs)
-    return matrix, np.asarray(targets, dtype=np.float64)
+    return matrix, np.asarray(targets, dtype=np.float64), basis_mean, basis_scale
 
 
 def fit_ridge(matrix, targets, alpha: float):
@@ -192,7 +205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     outcomes = load_outcomes(args.train_outcomes)
 
     print(f"학습 문항 수: {len(inputs.episodes)}  hash_bins={args.hash_bins}")
-    matrix, targets = build_training_matrix(inputs, outcomes, policy, args.hash_bins)
+    matrix, targets, basis_mean, basis_scale = build_training_matrix(
+        inputs, outcomes, policy, args.hash_bins
+    )
     print(f"특징 행렬: {matrix.shape}  타깃: {targets.shape}")
 
     model_count = len(MODEL_IDS)
@@ -305,6 +320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "model_ids": list(MODEL_IDS),
         "policy_id": policy.policy_id,
         "policy_sha256": policy_sha256(policy),
+        "basis_mean": [float(v) for v in basis_mean],
+        "basis_scale": [float(v) for v in basis_scale],
         "feature_mean": [float(v) for v in mean],
         "feature_scale": [float(v) for v in scale],
         "score_heads": {
