@@ -354,6 +354,16 @@ def _team_raw_feature_vector(episode: Episode, hash_bins: int) -> _TeamTuple[flo
 # (0.25, 0.5, 1) 0.6643 on the allocator, all three above the 0.6619 baseline.
 _TEAM_BASIS_FREQS: _TeamTuple[float, ...] = (0.5, 1.0, 2.0)
 
+# What this code implements. The artifact records the same facts, and until now
+# nothing compared the two -- which is why v20 could ship a 326-coefficient fit
+# evaluated on 266 features for a day without a single test noticing. These
+# constants exist so that a mismatch is a comparison someone can make, and
+# _team_parse_artifact makes it.
+_TEAM_ARTIFACT_TYPE = "team-router-v1"
+_TEAM_SCHEMA_VERSION = 1
+_TEAM_FEATURE_VERSION = "team-features-v1"
+_TEAM_HASH_ALGORITHM = "fnv1a64-signed-word-1-2"
+
 
 def _team_expand_basis(
     vector: Sequence[float],
@@ -4172,10 +4182,44 @@ _TEAM_ARTIFACT_JSON = r'''
 def _team_parse_artifact(text: str) -> _TeamArtifact:
     value = _team_loads_json(text)
 
+    def expect(field: str, actual, wanted) -> None:
+        if actual != wanted:
+            raise ProtocolError(
+                f"artifact의 {field}이(가) 이 코드와 다릅니다: {actual!r} != {wanted!r}"
+            )
+
+    # Six fields were baked to make a mismatch detectable and then never read.
+    # model_ids is the dangerous one: the code indexes predictions by its own
+    # _TEAM_MODEL_IDS, so a reordered artifact would assign every prediction to
+    # the wrong model and still run.
+    expect("artifact_type", value.get("artifact_type"), _TEAM_ARTIFACT_TYPE)
+    expect("schema_version", int(value.get("schema_version", -1)), _TEAM_SCHEMA_VERSION)
+    expect("feature_version", value.get("feature_version"), _TEAM_FEATURE_VERSION)
+    expect("hash_algorithm", value.get("hash_algorithm"), _TEAM_HASH_ALGORITHM)
+    expect("model_ids", tuple(value.get("model_ids", ())), tuple(_TEAM_MODEL_IDS))
+    expect(
+        "dense_feature_names",
+        tuple(value.get("dense_feature_names", ())),
+        tuple(_TEAM_DENSE_FEATURE_NAMES),
+    )
+
+    # The width the feature pipeline actually produces: the dense block, its
+    # sin/cos expansion at each frequency, and the hash slots. This is the
+    # assertion that would have caught v20's bug at load time instead of after
+    # a day of shipping.
+    dense = len(_TEAM_DENSE_FEATURE_NAMES)
+    width = dense * (1 + 2 * len(_TEAM_BASIS_FREQS)) + int(value["hash_bins"])
+    expect("feature_mean 길이", len(value["feature_mean"]), width)
+    expect("feature_scale 길이", len(value["feature_scale"]), width)
+    expect("basis_mean 길이", len(value["basis_mean"]), dense)
+    expect("basis_scale 길이", len(value["basis_scale"]), dense)
+
     def head(raw) -> _TeamLinearHead:
+        coefficients = tuple(float(c) for c in raw["coefficients"])
+        expect("head coefficients 길이", len(coefficients), width)
         return _TeamLinearHead(
             intercept=float(raw["intercept"]),
-            coefficients=tuple(float(c) for c in raw["coefficients"]),
+            coefficients=coefficients,
         )
 
     return _TeamArtifact(
