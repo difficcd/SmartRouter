@@ -70,6 +70,9 @@ function Write-Status($state, $detail) {
     $b += ""
     $b += $detail
     $b += ""
+    $t = & (Join-Path $Repo "training\cpu_temp.ps1") 2>$null
+    if ($t) { $b += "CPU 패키지 온도: $t °C" } else { $b += "CPU 온도: 읽을 수 없음 (LHM 웹서버 꺼짐)" }
+    $b += ""
     $b += "완료된 조각: $($slices.Count) / 12"
     if ($slices.Count -gt 0) { $b += ""; $b += ($slices -join ", ") }
     $b += ""

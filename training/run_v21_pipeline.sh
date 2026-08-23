@@ -33,7 +33,9 @@ PY=./.venv-data/Scripts/python
 # roughly 14 hours of work at this rate, so throughput is not the binding
 # constraint -- heat is.
 WORKERS=3
-COOLDOWN=240       # seconds of idle between chunks, for the same reason
+COOLDOWN=240       # fallback idle between chunks when no reading is available
+RESUME_TEMP=74     # resume once the package is back under this
+MAX_COOL=900       # but never wait longer than this for it
 
 NOTES_DIR="C:/Users/diffi/Desktop/SmartRouter"
 RESULT="$NOTES_DIR/v21-재탐색-결과.md"
@@ -98,7 +100,7 @@ run_slice() {
     say "${tag}/${s} (${tier}): 이미 완료 -- 건너뜀"
     return 0
   fi
-  say "${tag}/${s} (${tier}) risk_high=$*: 시작"
+  say "${tag}/${s} (${tier}) risk_high=$*: 시작 (현재 $(cpu_temp)°C)"
   $PY -u training/search_standalone.py \
       --matrices "$matrices" --tiers "$tier" --risk-high "$@" \
       --workers "$WORKERS" \
@@ -111,8 +113,39 @@ run_slice() {
     rm -f "$curve"
   fi
   write_progress
-  say "냉각 ${COOLDOWN}초"
-  sleep "$COOLDOWN"
+  cool_down
+}
+
+# Wait on a measurement rather than a stopwatch when one is available.
+# LibreHardwareMonitor's web server gives the package temperature; when it is
+# not running, cpu_temp.ps1 prints nothing and this falls back to the fixed
+# idle. It never invents a number -- an earlier session called the machine
+# "safe" from a CPU-utilisation proxy while it sat at 95C.
+cpu_temp() {
+  powershell -NoProfile -ExecutionPolicy Bypass -File training/cpu_temp.ps1 2>/dev/null
+}
+
+cool_down() {
+  local t
+  t="$(cpu_temp)"
+  if [ -z "$t" ]; then
+    say "냉각 ${COOLDOWN}초 (온도 못 읽음 -- 고정 대기)"
+    sleep "$COOLDOWN"
+    return
+  fi
+  say "냉각 시작 -- 현재 ${t}°C, ${RESUME_TEMP}°C 아래로 내려가면 재개 (최대 ${MAX_COOL}초)"
+  local waited=0
+  while [ "$waited" -lt "$MAX_COOL" ]; do
+    sleep 30
+    waited=$((waited + 30))
+    t="$(cpu_temp)"
+    [ -z "$t" ] && break
+    if [ "${t%.*}" -lt "$RESUME_TEMP" ]; then
+      say "냉각 완료 -- ${t}°C (${waited}초 대기)"
+      return
+    fi
+  done
+  say "냉각 종료 -- ${t}°C (${waited}초 대기, 상한 도달)"
 }
 
 finish_arm() {
