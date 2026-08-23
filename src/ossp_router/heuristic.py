@@ -4219,13 +4219,31 @@ def _team_load_artifact() -> _TeamArtifact:
 
 
 def _team_linear(head: _TeamLinearHead, values: Sequence[float]) -> float:
+    # zip() stops at the shorter argument and says nothing, which is how v20
+    # shipped a 326-coefficient fit evaluated on a 266-long feature vector:
+    # the 60 trigonometric coefficients were silently dropped and every test
+    # still passed. Length is checked here so that failure mode is loud.
+    if len(head.coefficients) != len(values):
+        raise ValueError(
+            f"feature width {len(values)} does not match the head's "
+            f"{len(head.coefficients)} coefficients"
+        )
     return head.intercept + _team_math.fsum(c * v for c, v in zip(head.coefficients, values))
 
 
 def _team_predict_episode(
     episode: Episode, artifact: _TeamArtifact
 ) -> _TeamTuple[_TeamMapping[str, float], _TeamMapping[str, float]]:
-    raw = _team_raw_feature_vector(episode, artifact.hash_bins)
+    raw = _team_expand_basis(
+        _team_raw_feature_vector(episode, artifact.hash_bins),
+        artifact.basis_mean,
+        artifact.basis_scale,
+    )
+    if len(raw) != len(artifact.feature_mean):
+        raise ValueError(
+            f"expanded feature width {len(raw)} does not match the artifact's "
+            f"{len(artifact.feature_mean)} standardization entries"
+        )
     standardized = tuple(
         (v - m) / s for v, m, s in zip(raw, artifact.feature_mean, artifact.feature_scale)
     )
