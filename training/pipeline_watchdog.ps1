@@ -21,6 +21,7 @@ $TaskName = "SmartRouter-v21-pipeline"
 $Repo = "C:\Users\diffi\Desktop\SmartRouter-main"
 $Result = "C:\Users\diffi\Desktop\SmartRouter\v21-재탐색-결과.md"
 $WatchLog = Join-Path $Repo "build\watchdog.log"
+$Status = "C:\Users\diffi\Desktop\SmartRouter\현재상태.md"
 
 if ($Register) {
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -46,6 +47,40 @@ if ($Unregister) {
     exit 0
 }
 
+# The one line that must never be a guess: whether the machine is computing
+# right now. Written by the watchdog rather than by Claude, so it stays true
+# even when no session is alive to report it.
+function Write-Status($state, $detail) {
+    $slices = @()
+    foreach ($tag in @("v21", "v21bag")) {
+        foreach ($sl in @("s1","s2","s3","s4","s5","s6")) {
+            if (Test-Path (Join-Path $Repo ("build" + [char]92 + $tag + "-curve-" + $sl + ".json"))) {
+                $slices += ($tag + "/" + $sl)
+            }
+        }
+    }
+    $b = @()
+    $b += "# 현재 상태"
+    $b += ""
+    $b += "자동 갱신: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  (감시자가 20분마다 씀)"
+    $b += ""
+    $b += "## 연산"
+    $b += ""
+    $b += "**$state**"
+    $b += ""
+    $b += $detail
+    $b += ""
+    $b += "완료된 조각: $($slices.Count) / 12"
+    if ($slices.Count -gt 0) { $b += ""; $b += ($slices -join ", ") }
+    $b += ""
+    $b += "## 같이 볼 파일"
+    $b += ""
+    $b += "- v21-검수기록.md : 오늘 검수한 것 (큰 단락별)"
+    $b += "- v21-진행상황.md : 조각별 진행표"
+    $b += "- v21-재탐색-결과.md : 최종 결과 (완료 시 생성)"
+    $b | Set-Content -Path $Status -Encoding utf8
+}
+
 function Note($msg) {
     "[{0}] {1}" -f (Get-Date -Format "MM-dd HH:mm:ss"), $msg |
         Add-Content -Path $WatchLog -Encoding utf8
@@ -55,6 +90,7 @@ function Note($msg) {
 # day against work that is already done.
 if (Test-Path $Result) {
     Note "결과 파일 존재 -- 감시 종료, 태스크 해제"
+    Write-Status "완료" "재탐색이 끝났습니다. v21-재탐색-결과.md 를 보세요."
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     exit 0
 }
@@ -66,6 +102,7 @@ $running = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAct
                    $_.CommandLine -like '*audit_operating_point*' }
 if ($running) {
     Note ("실행 중 ({0}개) -- 아무것도 하지 않음" -f @($running).Count)
+    Write-Status "돌아가는 중" ("탐색 프로세스 {0}개 확인. 워커 3개, 조각 간 240초 냉각." -f @($running).Count)
     exit 0
 }
 
@@ -76,3 +113,4 @@ Start-Process -FilePath $bash `
     -ArgumentList "-lc", "cd '$($Repo -replace '\\','/')' && bash training/run_v21_pipeline.sh" `
     -WindowStyle Hidden
 Note "재시작 요청 보냄"
+Write-Status "멈춰 있었음 -> 재시작함" "감시자가 중단을 감지하고 다시 띄웠습니다. 끝난 조각은 건너뜁니다."

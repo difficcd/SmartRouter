@@ -77,7 +77,12 @@ def collect(split, artifact):
         X.append(_team_expand_basis(
             _team_raw_feature_vector(ep, artifact["hash_bins"]), bmean, bscale))
         S.append([float(index[(ep.episode_id, m)].score) for m in MODEL_IDS])
-        C.append([index[(ep.episode_id, m)].input_tokens * rin[m]
+        # fixed_cost is 0 for all three models today, but the official scorer
+        # includes it and so do train_router and calibrate_safety. Leaving it
+        # out here would make this script quietly disagree with them the day a
+        # policy sets it.
+        C.append([float(policy.models[m].fixed_cost)
+                  + index[(ep.episode_id, m)].input_tokens * rin[m]
                   + index[(ep.episode_id, m)].output_tokens * rout[m]
                   for m in MODEL_IDS])
     return np.array(X, float), np.array(S, float), np.array(C, float)
