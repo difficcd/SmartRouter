@@ -21,7 +21,7 @@ shipped allocator:
 The output is the margin in each dimension: the point where the tier stops
 passing. That turns "we do not know the tail" into a number.
 
-    py -3.13 training/stress_test.py
+    py -3.13 training/stress_scenarios.py
 """
 
 from __future__ import annotations

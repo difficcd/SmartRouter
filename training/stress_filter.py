@@ -5,7 +5,7 @@
 
 The bootstrap picks a safety point by replaying observed variation, which
 means it never asks what happens if the batch-level cost multiple itself
-moves. stress_test.py showed that question has teeth: on main, balanced fails
+moves. stress_scenarios.py showed that question has teeth: on main, balanced fails
 once ax31's batch multiple reaches 3.0 -- a 39% shift, far outside the 2.5%
 the two splits show, but also exactly the bound our share-based constraint
 assumes.
