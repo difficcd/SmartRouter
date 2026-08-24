@@ -1151,8 +1151,8 @@ _TEAM_ARTIFACT_JSON = r'''
   "hash_bins": 256,
   "high_cap_ratio": {
     "balanced": 1.0,
-    "fast": 1.0,
-    "premium": 1.0
+    "fast": 0.5,
+    "premium": 0.8
   },
   "log_cost_heads": {
     "ax31": {
@@ -3153,19 +3153,19 @@ _TEAM_ARTIFACT_JSON = r'''
   "policy_sha256": "7c892c423da5fa762e7e1a93b9fa071be51e259b65d2b63a5ba434c4342d7a8e",
   "risk_multiplier": {
     "balanced": {
-      "ax31": 3.0,
+      "ax31": 1.5,
       "ax31-light": 1.0,
-      "axk1-think": 4.0
+      "axk1-think": 5.0
     },
     "fast": {
-      "ax31": 1.0,
+      "ax31": 2.5,
       "ax31-light": 1.0,
-      "axk1-think": 6.0
+      "axk1-think": 1.0
     },
     "premium": {
-      "ax31": 1.0,
+      "ax31": 1.5,
       "ax31-light": 1.0,
-      "axk1-think": 2.5
+      "axk1-think": 2.0
     }
   },
   "schema_version": 1,
@@ -4165,14 +4165,14 @@ _TEAM_ARTIFACT_JSON = r'''
     }
   },
   "share_ratio": {
-    "balanced": 1.0,
-    "fast": 0.8,
-    "premium": 1.0
+    "balanced": 0.9,
+    "fast": 0.7,
+    "premium": 0.6
   },
   "tier_safety_ratios": {
-    "balanced": 0.88,
-    "fast": 0.4,
-    "premium": 0.6
+    "balanced": 0.5,
+    "fast": 0.15,
+    "premium": 0.4
   }
 }
 '''
