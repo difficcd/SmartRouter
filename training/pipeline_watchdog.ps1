@@ -52,7 +52,7 @@ if ($Unregister) {
 # even when no session is alive to report it.
 function Write-Status($state, $detail) {
     $slices = @()
-    foreach ($tag in @("v21", "v21bag")) {
+    foreach ($tag in @("v21", "v21bag", "v21nb")) {
         foreach ($sl in @("s1","s2","s3","s4","s5","s6")) {
             if (Test-Path (Join-Path $Repo ("build" + [char]92 + $tag + "-curve-" + $sl + ".json"))) {
                 $slices += ($tag + "/" + $sl)
@@ -73,7 +73,7 @@ function Write-Status($state, $detail) {
     $t = & (Join-Path $Repo "training\cpu_temp.ps1") 2>$null
     if ($t) { $b += "CPU 패키지 온도: $t °C" } else { $b += "CPU 온도: 읽을 수 없음 (LHM 웹서버 꺼짐)" }
     $b += ""
-    $b += "완료된 조각: $($slices.Count) / 12"
+    $b += "완료된 조각: $($slices.Count) / 18"
     if ($slices.Count -gt 0) { $b += ""; $b += ($slices -join ", ") }
     $b += ""
     $b += "## 같이 볼 파일"

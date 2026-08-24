@@ -77,7 +77,7 @@ write_progress() {
     echo
     echo "| 팔 | 조각 | 등급 | 상태 |"
     echo "|---|---|---|---|"
-    for tag in v21 v21bag; do
+    for tag in v21 v21bag v21nb; do
       for row in "${SLICES[@]}"; do
         set -- $row
         local s="$1" tier="$2"
@@ -198,6 +198,19 @@ for row in "${SLICES[@]}"; do
 done
 finish_arm v21bag training/tmp-v21bag-matrices.npz
 
+# The arm that was never built: a properly trained 266-feature model. v20b does
+# not ship the trigonometric basis, it ships a 326-coefficient fit evaluated on
+# 266 features, so "v20b vs v21" compared a misspecified linear-ish model
+# against a correct nonlinear one and left this cell empty. It matters because
+# v21 loses badly on composition shift -- premium 3.2498 against v20b's 2.5478
+# on a length-skewed batch -- and a nonlinear transform of length-derived
+# features is exactly what should degrade there.
+for row in "${SLICES[@]}"; do
+  set -- $row
+  run_slice v21nb training/tmp-v21nb-matrices.npz "$@"
+done
+finish_arm v21nb training/tmp-v21nb-matrices.npz
+
 say "요약 작성"
 {
   echo "# v21 재탐색 결과"
@@ -214,9 +227,10 @@ say "요약 작성"
   echo "|---|---|"
   echo "| main (v20b, 버그 있는 상태) | 0.666941 |"
   echo
-  for tag in v21 v21bag; do
-    label="v21 (버그 수정)"
+  for tag in v21 v21bag v21nb; do
+    label="v21 (버그 수정, 삼각함수 326)"
     [ "$tag" = "v21bag" ] && label="v21 + 배깅 300"
+    [ "$tag" = "v21nb" ] && label="266 특징 (삼각함수 없음, 정상 학습)"
     echo "## $label"
     echo
     echo "| 초과확률 목표 | 가중합 | fast | balanced | premium |"
