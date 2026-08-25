@@ -232,6 +232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
              "평균낸다(배깅). 계수는 여전히 한 벌이므로 추론 비용은 0. "
              "홀드아웃 기준 300회부터 시드 영향이 무의미해진다.",
     )
+    parser.add_argument(
+        "--flip-blend", type=float, default=0.0,
+        help="ax31 점수 헤드에 승격 사건 분류기를 이 계수로 섞는다 (0이면 사용 안 함).",
+    )
+    parser.add_argument("--flip-alpha", type=float, default=10000.0)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -338,6 +343,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     score_mean, score_scale, score_intercept, score_coefficients = fit_ridge(
         matrix, score_targets, score_alpha
     )
+    if args.flip_blend > 0.0:
+        # Correct the ax31 score head with a classifier of the PROMOTION EVENT.
+        #
+        # 75% of episodes have exactly zero ax31 gain -- both models right, or
+        # both wrong -- so a least-squares fit of the score spends itself on
+        # ties, and the ranking the allocator actually consumes comes out
+        # nearly uninformative (correlation -0.03 with the true gain). Fitting
+        # {+1 flip, -1 harm, 0 tie} instead asks the allocator's own question,
+        # and lifts the real gain in the top 50 episodes from 0.2100 to 0.2400.
+        #
+        # It folds into the existing head rather than adding one: both are
+        # linear in the same standardised features, so
+        #     new_coef = coef + blend * flip_coef
+        # is exactly "score plus blend times classifier". No new head, no new
+        # inference path, and therefore none of the wiring risk that let v20
+        # ship a basis it never used.
+        light, mid = 0, 1
+        gain = score_targets[:, mid] - score_targets[:, light]
+        signal = np.sign(gain).reshape(-1, 1)
+        _, _, flip_intercept, flip_coefficients = fit_ridge(
+            matrix, signal, args.flip_alpha
+        )
+        centre = float(
+            predict_ridge(matrix, score_mean, score_scale,
+                          flip_intercept, flip_coefficients).mean()
+        )
+        score_coefficients[:, mid] += args.flip_blend * flip_coefficients[:, 0]
+        score_intercept[mid] += args.flip_blend * (float(flip_intercept[0]) - centre)
+        print(f"뒤집힘 분류기 반영: blend={args.flip_blend:g} "
+              f"alpha={args.flip_alpha:g} 중심={centre:+.4f}")
     cost_mean, cost_scale, cost_intercept, cost_coefficients = fit_ridge(
         matrix, cost_targets, cost_budget_alpha
     )
