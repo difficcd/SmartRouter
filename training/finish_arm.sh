@@ -53,6 +53,14 @@ done
 # k=5000 against ONE fixed configuration: no selection, so the bound is a
 # certificate rather than a corrected estimate.
 if [ -f "build/${TAG}-target-0.003.json" ]; then
+# Before spending three minutes on the audit, ask the curve whether the pick
+# is even plausible: a point cannot overrun less often than one that spends
+# less budget, so a dip is noise and the selector walks into dips by
+# construction. This caught v23's premium, which the audit then confirmed at
+# 0.721% against a 0.3% target.
+say "선택 지점 단조성 점검"
+$PY training/check_pick_monotone.py --params "build/${TAG}-target-0.003.json" --tag "${TAG}" > "build/${TAG}-monotone.log" 2>&1 && say "단조성 OK" || say "!! 잡음으로 뽑힌 지점 의심 -- build/${TAG}-monotone.log 확인"
+
   say "k=5000 감사"
   $PY -u training/audit_operating_point.py --matrices "$MATRICES" \
       --config "build/${TAG}-target-0.003.json" -k 5000 \
