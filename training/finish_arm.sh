@@ -74,8 +74,27 @@ $PY -u training/private_set_stress.py --params "build/${TAG}-target-0.003.json" 
     --matrices "$MATRICES" > "build/${TAG}-stress.log" 2>&1 \
   && say "스트레스 완료" || say "!! 스트레스 실패"
 
-say "완료. 로그: build/${TAG}-{audit,selfcheck,stress}.log"
+# The composition stress above varies WHICH episodes are in the batch. This
+# one varies HOW EXPENSIVE they turn out to be -- and it is the test that
+# decided v21d over v20b, because it is the one that finds a setting where
+# all three tiers cross at once and the total score goes to zero. Running
+# only the first let v22 look clean while it had three such settings.
+say "비용 폭주 시나리오"
+$PY -u training/stress_scenarios.py --params "build/${TAG}-target-0.003.json" --matrices "$MATRICES" > "build/${TAG}-scenarios.log" 2>&1 && say "시나리오 완료" || say "!! 시나리오 실패"
+
+# The one number that decides adoption: does any setting take all three
+# tiers at once? grep -c exits 1 when it finds nothing, so let it print its
+# own 0 rather than appending one.
+zero=$(grep -c "!.*!.*!" "build/${TAG}-scenarios.log" 2>/dev/null)
+if [ "${zero:-0}" -gt 0 ]; then
+  say "!! 총점 0 시나리오 ${zero}개 -- 채택 전에 반드시 확인"
+else
+  say "총점 0 시나리오 없음"
+fi
+
+say "완료. 로그: build/${TAG}-{audit,selfcheck,stress,scenarios}.log"
 echo
 echo "===== 감사 ====="; cat "build/${TAG}-audit.log" 2>/dev/null
 echo; echo "===== self-check ====="; head -8 "build/${TAG}-selfcheck.log" 2>/dev/null
 echo; echo "===== 스트레스 ====="; cat "build/${TAG}-stress.log" 2>/dev/null
+echo; echo "===== 폭주 시나리오 ====="; cat "build/${TAG}-scenarios.log" 2>/dev/null

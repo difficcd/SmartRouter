@@ -38,6 +38,27 @@ sys.path.insert(0, str(REPO_ROOT / "training"))
 from search_standalone import TIER_ORDER, allocate, load_splits  # noqa: E402
 
 
+def search_params(path):
+    """Parameters from a finalize_search result, so an arm that is not the one
+    currently baked into heuristic.py can still be stressed. Comparing two arms
+    otherwise means switching branches between runs, which is how the wrong
+    numbers end up side by side in a table."""
+    import json
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from ossp_router.protocol import MODEL_IDS
+    r = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {
+        tier: dict(
+            safety_ratio=float(r[tier]["safety_ratio"]),
+            risk=np.array([1.0, float(r[tier]["risk_mid"]),
+                           float(r[tier]["risk_high"])]),
+            high_cap_ratio=float(r[tier]["high_cap_ratio"]),
+            share_ratio=float(r[tier].get("share_ratio", 1.0)),
+        )
+        for tier in TIER_ORDER
+    }
+
+
 def artifact_params():
     import json
     sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -72,11 +93,14 @@ def ratio(tier, params, budget, ps, pc, prc, rc):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--matrices", default=str(REPO_ROOT / "build/search-matrices.npz"))
+    parser.add_argument("--params", default=None,
+                        help="finalize_search 결과 JSON. 없으면 구워진 아티팩트를 씁니다")
     args = parser.parse_args(argv)
 
     splits, data = load_splits(args.matrices)
     budgets = dict(zip(TIER_ORDER, data["budget_multipliers"].tolist()))
-    params = artifact_params()
+    params = search_params(args.params) if args.params else artifact_params()
+    print(f"파라미터 출처: {args.params or '구워진 아티팩트'}")
 
     for split_name, (ps, pc, prc, rs, rc) in zip(("dev", "train"), splits):
         print(f"\n{'=' * 68}\n{split_name}")
