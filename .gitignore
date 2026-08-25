@@ -34,3 +34,12 @@ notes/
 # 학습 산출물 
 /models/
 .playwright-mcp/
+
+# Exported search matrices: regenerated exactly by
+# training/export_matrices.py from data/ and the artifact, so committing them
+# only puts binary blobs in a public tree. Verified bit-identical.
+training/tmp-*-matrices.npz
+
+# Local pipeline runners holding absolute home-directory paths.
+training/run_v2*_pipeline.sh
+training/pipeline_watchdog.ps1
