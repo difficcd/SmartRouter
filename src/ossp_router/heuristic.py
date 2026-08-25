@@ -3184,9 +3184,9 @@ _TEAM_ARTIFACT_JSON = r'''
       "axk1-think": 2.0
     },
     "premium": {
-      "ax31": 1.2,
+      "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 5.0
+      "axk1-think": 4.0
     }
   },
   "schema_version": 1,
