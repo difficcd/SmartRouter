@@ -36,6 +36,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ossp_router.heuristic import (  # noqa: E402
+    _TEAM_ARTIFACT_TYPE,
+    _TEAM_FEATURE_VERSION,
+    _TEAM_HASH_ALGORITHM,
+    _TEAM_SCHEMA_VERSION,
     _TEAM_DENSE_FEATURE_NAMES,
     _team_expand_basis,
     _team_raw_feature_vector,
@@ -348,10 +352,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return {"intercept": float(intercept), "coefficients": [float(c) for c in coefficients]}
 
     artifact = {
-        "artifact_type": "team-router-v1",
-        "schema_version": 1,
-        "feature_version": "team-features-v1",
-        "hash_algorithm": "fnv1a64-signed-word-1-2",
+        # Taken from heuristic.py rather than repeated here. These four fields
+        # exist so a mismatch between artifact and code is detectable, and a
+        # literal copy in the trainer defeats that: bumping the feature version
+        # in one place and not the other produces an artifact that fails its own
+        # check, which is what just happened.
+        "artifact_type": _TEAM_ARTIFACT_TYPE,
+        "schema_version": _TEAM_SCHEMA_VERSION,
+        "feature_version": _TEAM_FEATURE_VERSION,
+        "hash_algorithm": _TEAM_HASH_ALGORITHM,
         "hash_bins": args.hash_bins,
         "dense_feature_names": list(_TEAM_DENSE_FEATURE_NAMES),
         "model_ids": list(MODEL_IDS),
