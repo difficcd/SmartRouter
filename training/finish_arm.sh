@@ -22,6 +22,17 @@ LOG="build/${TAG}-finish.log"
 say() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 : > "$LOG"
 
+# The script bakes into the working tree, so the working tree must be on the
+# arm's own branch. Being on a different one would bake this arm's coefficients
+# into another arm's artifact -- silently, since both files are named the same.
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$BRANCH" != "SmartRouter-${TAG}" ]; then
+  say "!! 브랜치 ${BRANCH} 인데 ${TAG} 를 마무리하려 함 -- 중단"
+  say "   먼저: git checkout SmartRouter-${TAG}"
+  exit 1
+fi
+say "브랜치 ${BRANCH} 확인"
+
 curves=(build/${TAG}-curve-s*.json)
 if [ "${#curves[@]}" -ne 6 ]; then
   say "!! 곡선 ${#curves[@]}/6 -- 중단"
