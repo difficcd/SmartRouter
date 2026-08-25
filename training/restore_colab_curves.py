@@ -105,12 +105,15 @@ def main(argv=None) -> int:
         print(f"OK {slice_id}: {len(rows)}조합 {pts}점 SHA={digest} -> {path.name}")
         seen[slice_id] = digest
 
-    ok = len(seen)
+    on_disk = {q.name.rsplit('-', 1)[1][:-5]
+               for q in args.out_dir.glob(f'{args.tag}-curve-s*.json')}
+    ok = len(on_disk)
     print()
-    print(f"복원 {ok}/6  ({', '.join(sorted(seen))})")
-    missing = sorted({f's{n}' for n in range(1, 7)} - set(seen))
+    print(f"이번에 복원 {len(seen)}개  ({', '.join(sorted(seen)) or '없음'})")
+    print(f"디스크에 모인 곡선 {ok}/6  ({', '.join(sorted(on_disk))})")
+    missing = sorted({f's{n}' for n in range(1, 7)} - on_disk)
     if missing:
-        print(f"빠진 조각: {', '.join(missing)}")
+        print(f"아직 없는 조각: {', '.join(missing)}")
     if ok != 6:
         print("6개가 모두 있어야 보정으로 넘어갑니다.")
         return 1
