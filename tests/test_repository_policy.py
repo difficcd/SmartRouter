@@ -105,6 +105,7 @@ DATA_CONFIGURATIONS = {
 
 LOCAL_GENERATED_PREFIXES = (
     (".git",),
+    (".pytest_cache",),
     (".ruff_cache",),
     (".venv",),
     (".venv-data",),
