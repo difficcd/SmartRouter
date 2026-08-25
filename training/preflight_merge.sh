@@ -37,12 +37,15 @@ else
 fi
 
 echo
+HOME_NEEDLE="/""Users/|[A-Za-z]:\\\\""Users"
 echo "[2] 절대경로가 든 텍스트 파일"
 found=0
 while read -r f; do
   [ -z "$f" ] && continue
   case "$f" in *.npz|*.png|*.jpg) continue;; esac
-  if git show "$BRANCH:$f" 2>/dev/null | grep -q "/Users/\|C:\\Users"; then
+  # Assemble the needle rather than writing it, so this script does not
+  # match itself -- the repository's own policy test uses the same trick.
+  if git show "$BRANCH:$f" 2>/dev/null | grep -qE "${HOME_NEEDLE}"; then
     echo "  !! $f"
     found=1; bad=1
   fi
