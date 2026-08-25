@@ -1165,8 +1165,8 @@ _TEAM_ARTIFACT_JSON = r'''
   "hash_algorithm": "fnv1a64-signed-word-1-2",
   "hash_bins": 256,
   "high_cap_ratio": {
-    "balanced": 1.0,
-    "fast": 1.0,
+    "balanced": 0.5,
+    "fast": 0.5,
     "premium": 1.0
   },
   "log_cost_heads": {
@@ -3176,17 +3176,17 @@ _TEAM_ARTIFACT_JSON = r'''
     "balanced": {
       "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 1.0
+      "axk1-think": 6.0
     },
     "fast": {
-      "ax31": 1.0,
+      "ax31": 3.0,
       "ax31-light": 1.0,
-      "axk1-think": 1.0
+      "axk1-think": 3.0
     },
     "premium": {
       "ax31": 1.0,
       "ax31-light": 1.0,
-      "axk1-think": 1.0
+      "axk1-think": 2.0
     }
   },
   "schema_version": 1,
@@ -4189,14 +4189,14 @@ _TEAM_ARTIFACT_JSON = r'''
     }
   },
   "share_ratio": {
-    "balanced": 1.0,
-    "fast": 1.0,
+    "balanced": 0.7,
+    "fast": 0.9,
     "premium": 1.0
   },
   "tier_safety_ratios": {
-    "balanced": 1.0,
-    "fast": 1.0,
-    "premium": 1.0
+    "balanced": 0.6,
+    "fast": 0.92,
+    "premium": 0.3
   }
 }
 '''
