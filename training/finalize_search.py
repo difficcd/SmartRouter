@@ -38,8 +38,27 @@ from search_standalone import (  # noqa: E402
     TIER_ORDER,
     bootstrap,
     load_splits,
+    allocate,
     pick_from_curve,
 )
+
+
+def _tier_ratio(tier, cfg, budget, split):
+    """Budget ratio this configuration realises on one split.
+
+    The curves record score and overrun but not what fraction of the cap was
+    actually spent, so a tie-break on margin has to recompute it."""
+    pred_scores, pred_costs, pred_rank_costs, _real_scores, real_costs = split
+    choice = allocate(
+        pred_scores, pred_costs, pred_rank_costs,
+        budget_multiplier=budget,
+        safety_ratio=cfg["safety_ratio"],
+        risk_multiplier=np.array([1.0, cfg["risk_mid"], cfg["risk_high"]]),
+        high_cap_ratio=cfg.get("high_cap_ratio", HIGH_CAP_GRID[0]),
+        share_ratio=cfg.get("share_ratio", SHARE_RATIO_GRID[-1]),
+    )
+    idx = np.arange(len(choice))
+    return float(real_costs[idx, choice].sum() / real_costs[:, 0].sum())
 
 
 def _binom_cdf(x: int, n: int, p: float) -> float:
@@ -127,22 +146,56 @@ def main(argv=None) -> int:
         budget_multipliers.update(chunk["budget_multipliers"])
 
     measure = make_measure(args.rule, args.alpha)
-    best = {}
+    splits, _ = load_splits(args.matrices)
+
+    # Keep every candidate. One episode can move a tier score by 1/n, so two
+    # points whose scores differ by far less than that are tied in every sense
+    # that matters -- and picking between them on score alone hands the
+    # decision to bootstrap noise. v22's premium was chosen over a point
+    # scoring 1.2e-5 less that held 2.7x less variation between the splits.
+    candidates = {}
     for row in rows:
         safety, overrun, score = pick_from_curve(
             row["curve"], args.overrun_target, measure)
-        tier = row["tier"]
-        if tier not in best or score > best[tier]["score"]:
-            best[tier] = {
-                "risk_mid": row["risk_mid"], "risk_high": row["risk_high"],
-                "safety_ratio": safety, "overrun": overrun, "score": score,
-            }
+        candidates.setdefault(row["tier"], []).append({
+            "risk_mid": row["risk_mid"], "risk_high": row["risk_high"],
+            "safety_ratio": safety, "overrun": overrun, "score": score,
+        })
+
+    best = {}
+    for tier, cands in candidates.items():
+        top = max(c["score"] for c in cands)
+        n = len(splits[0][0])
+        # A tenth of what one episode can move the score. One full episode is
+        # too loose a definition of "tied": at that width the better-margin pick
+        # can cost real score, and a difference that large is not obviously
+        # noise. A tenth is unambiguous -- no single observation explains it.
+        tol = 0.1 / n
+        tied = [c for c in cands if top - c["score"] <= tol]
+        if len(tied) == 1:
+            best[tier] = tied[0]
+            continue
+        # Among the tied, take the one whose worst split leaves most room.
+        scored = []
+        for c in tied:
+            ratios = [_tier_ratio(tier, c, budget_multipliers[tier], s)
+                      for s in splits]
+            scored.append((budget_multipliers[tier] - max(ratios), c, ratios))
+        scored.sort(key=lambda x: -x[0])
+        room, chosen, ratios = scored[0]
+        best[tier] = chosen
+        if chosen is not max(tied, key=lambda c: c["score"]):
+            other = max(tied, key=lambda c: c["score"])
+            print(f"  {tier}: 동점 {len(tied)}개 중 여유가 큰 쪽 채택 "
+                  f"(점수 {chosen['score']:.6f} vs {other['score']:.6f}, "
+                  f"차이 {other['score']-chosen['score']:.2e} "
+                  f"< 1문항의 1/10 {tol:.2e})")
+
 
     missing = [t for t in TIER_ORDER if t not in best]
     if missing:
         raise SystemExit(f"곡선에 없는 등급: {missing}")
 
-    splits, _ = load_splits(args.matrices)
     rule_note = "Clopper-Pearson 상한" if args.rule == "ucb" else "부트스트랩 빈도"
     if args.rule == "ucb":
         rule_note += f", alpha={args.alpha}"

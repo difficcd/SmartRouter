@@ -36,6 +36,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ossp_router.heuristic import (  # noqa: E402
+    _TEAM_ARTIFACT_TYPE,
+    _TEAM_FEATURE_VERSION,
+    _TEAM_HASH_ALGORITHM,
+    _TEAM_SCHEMA_VERSION,
     _TEAM_DENSE_FEATURE_NAMES,
     _team_expand_basis,
     _team_raw_feature_vector,
@@ -104,6 +108,25 @@ def build_training_matrix(
     return matrix, np.asarray(targets, dtype=np.float64), basis_mean, basis_scale
 
 
+# Bagging is module state rather than a parameter threaded through every call
+# site, and that is deliberate. fit_ridge is reached from four places -- alpha
+# selection, out-of-fold predictions, the smearing correction, and the final
+# fit -- and if any one of them disagreed with the others about whether to bag,
+# the artifact would be an inconsistent mixture with nothing to warn us. One
+# switch makes that impossible.
+_BAGS = 0
+_BAG_SEED = 20260823
+
+
+def _solve_ridge(standardized, centered, alpha: float):
+    rows, columns = standardized.shape
+    if rows <= columns:
+        system = standardized @ standardized.T + alpha * np.eye(rows)
+        return standardized.T @ np.linalg.solve(system, centered)
+    system = standardized.T @ standardized + alpha * np.eye(columns)
+    return np.linalg.solve(system, standardized.T @ centered)
+
+
 def fit_ridge(matrix, targets, alpha: float):
     mean = matrix.mean(axis=0)
     scale = matrix.std(axis=0)
@@ -112,14 +135,18 @@ def fit_ridge(matrix, targets, alpha: float):
     intercept = targets.mean(axis=0)
     centered = targets - intercept
 
-    rows, columns = standardized.shape
-    if rows <= columns:
-        system = standardized @ standardized.T + alpha * np.eye(rows)
-        coefficients = standardized.T @ np.linalg.solve(system, centered)
-    else:
-        system = standardized.T @ standardized + alpha * np.eye(columns)
-        coefficients = np.linalg.solve(system, standardized.T @ centered)
-    return mean, scale, intercept, coefficients
+    if _BAGS <= 0:
+        return mean, scale, intercept, _solve_ridge(standardized, centered, alpha)
+
+    # Standardization and intercept come from the FULL block, not from each
+    # resample, so the averaged coefficients remain one usable coefficient set.
+    # Bagging has to stay free at inference or it cannot ship in the container.
+    rng = np.random.default_rng(_BAG_SEED)
+    accumulated = np.zeros((standardized.shape[1], centered.shape[1]))
+    for _ in range(_BAGS):
+        pick = rng.integers(0, standardized.shape[0], standardized.shape[0])
+        accumulated += _solve_ridge(standardized[pick], centered[pick], alpha)
+    return mean, scale, intercept, accumulated / _BAGS
 
 
 def predict_ridge(matrix, mean, scale, intercept, coefficients):
@@ -197,8 +224,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="split: 예산용/랭킹용 alpha를 따로 + 배치합 보정 (v10/v11). "
              "classic: 하나의 log-MSE alpha + Duan smearing (v8).",
     )
+    parser.add_argument(
+        "--bags",
+        type=int,
+        default=0,
+        help="0이면 단일 적합. >0이면 Train 행을 이 횟수만큼 재표본해 계수를 "
+             "평균낸다(배깅). 계수는 여전히 한 벌이므로 추론 비용은 0. "
+             "홀드아웃 기준 300회부터 시드 영향이 무의미해진다.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+
+    global _BAGS
+    _BAGS = args.bags
+    if _BAGS > 0:
+        print(f"배깅 {_BAGS}회 (시드 {_BAG_SEED}) -- alpha 선택, out-of-fold, "
+              f"smearing, 최종 적합 전부 동일 설정")
 
     policy = load_bundled_policy()
     inputs = load_input(args.train_input)
@@ -311,10 +352,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return {"intercept": float(intercept), "coefficients": [float(c) for c in coefficients]}
 
     artifact = {
-        "artifact_type": "team-router-v1",
-        "schema_version": 1,
-        "feature_version": "team-features-v1",
-        "hash_algorithm": "fnv1a64-signed-word-1-2",
+        # Taken from heuristic.py rather than repeated here. These four fields
+        # exist so a mismatch between artifact and code is detectable, and a
+        # literal copy in the trainer defeats that: bumping the feature version
+        # in one place and not the other produces an artifact that fails its own
+        # check, which is what just happened.
+        "artifact_type": _TEAM_ARTIFACT_TYPE,
+        "schema_version": _TEAM_SCHEMA_VERSION,
+        "feature_version": _TEAM_FEATURE_VERSION,
+        "hash_algorithm": _TEAM_HASH_ALGORITHM,
         "hash_bins": args.hash_bins,
         "dense_feature_names": list(_TEAM_DENSE_FEATURE_NAMES),
         "model_ids": list(MODEL_IDS),
