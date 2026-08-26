@@ -4194,7 +4194,7 @@ _TEAM_ARTIFACT_JSON = r'''
     "premium": 0.7
   },
   "tier_safety_ratios": {
-    "balanced": 0.6,
+    "balanced": 0.5,
     "fast": 0.2,
     "premium": 0.3
   }
