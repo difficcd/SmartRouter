@@ -1,7 +1,135 @@
 <!--
+SPDX-FileCopyrightText: Copyright 2026 difficcd
 SPDX-FileCopyrightText: Copyright 2026 SK TELECOM CO., LTD.
 SPDX-License-Identifier: Apache-2.0
 -->
+
+# SmartRouter
+
+프롬프트 텍스트만 보고 세 개의 LLM 중 하나를 고르는 라우터입니다.
+2026 오픈소스 개발자대회 지정과제(SK텔레콤) 출품작입니다.
+
+**추론 경로에 서드파티 의존성이 없습니다.** 모델 가중치도, 토크나이저 파일도,
+네트워크 호출도 없습니다. 릿지 회귀 계수 2,952개가 JSON 텍스트로 저장소에
+들어 있고, 컨테이너 이미지는 23MB입니다.
+
+```console
+docker run --rm --platform linux/arm64 \
+  --cpus 2 --memory 2g --network none --read-only --tmpfs /tmp:rw,size=64m \
+  -v "$PWD/inputs.json:/challenge/input/inputs.json:ro" -v "$PWD/out:/challenge/output" \
+  ghcr.io/difficcd/smartrouter@sha256:b7e04a8cab897716da06a0daa63b017ae8d4b375f49cab206e9cbee3a6b642d8 \
+  --input /challenge/input/inputs.json --tier fast --output /challenge/output/submission.json
+```
+
+## 이 과제의 어려운 점
+
+등급마다 비용 한도가 있고, **한도를 조금이라도 넘기면 그 등급 점수가 0**입니다.
+평균 비용을 잘 맞히는 것으로는 부족하고 넘길 위험 자체를 통제해야 합니다.
+주최측이 baseline 사례를 기록해 두었습니다. 공개 Dev에서 premium 비용비율
+`3.985`였던 hash-regex가 채점용 평가셋에서 약 `4.2`로 나타나 한도를 넘겨
+premium 점수가 0으로 계산됐습니다.
+
+## 핵심 아이디어 — 부정확한 예측 위에서 안전을 보장한다
+
+개별 문항의 비용 예측은 정확하지 않습니다. 중앙 오차가 34~79%입니다.
+그런데 **배치 전체에서 본 모델별 비용 배수는 두 공개 split 사이에서 2.5%밖에
+움직이지 않습니다.**
+
+예산 비율은 이렇게 쓸 수 있습니다.
+
+```
+ratio = 1 + Σ_m (ρ_m − 1) · s_m
+
+  ρ_m : 모델 m 의 배치 비용 배수      (split 간 2.5% 변동 — 안정적)
+  s_m : 모델 m 으로 승격된 문항이 차지하는 light 비용 비중 (정규화된 값)
+```
+
+`s_m`이 정규화된 비중이라 **비용 수준의 전역 오차가 상쇄됩니다.** 그래서
+부정확한 개별 예측 대신 안정적인 `ρ`와 `s`에 상한을 걸었습니다. 배치 비용
+배수가 관측 범위를 크게 벗어나지 않는 한 예산 초과가 구조적으로 막힙니다.
+
+이 설계 덕분에 개별 비용 예측이 34~79% 틀려도 두 공개 split 모두 예산을
+통과합니다.
+
+## 구조
+
+```
+프롬프트 → 특징 327개 → 릿지 6헤드(모델 3 × 품질/비용) → λ 이분 배분 → 모델 선택
+```
+
+- **특징 327개** — dense 10개(길이·문장수·한글비율·코드기호·수식기호·숫자밀도 등)
+  + 삼각함수 기저 확장 60개 + 부호 있는 단어 1·2-gram 해시 256칸 + 해시블록 크기 1개.
+  전부 표준 라이브러리로 계산합니다.
+- **λ 이분 배분기** — 문항을 하나씩 판단하지 않고 배치 전체를 한 번에 풉니다.
+  `argmax[ q̂(m) − λ · r[m] · ĉ(m) / L ]` 로 고르고, λ를 이분 탐색으로 올려가며
+  예측 지출이 한도에 닿는 지점을 찾습니다. λ가 예산의 그림자 가격 역할을 합니다.
+- **안전계수** — `내부 상한 = light 비용합 × (1 + (등급배수 − 1) × 안전계수)`.
+  한도에 계수를 그대로 곱하면 같은 값이 등급마다 다른 뜻이 되므로,
+  "한도가 준 여유분 중 몇 %를 쓸 것인가"라는 하나의 뜻을 갖게 했습니다.
+
+## 실행과 재현
+
+```console
+# 공개 두 split 의 등급별 점수와 예산 비율을 그대로 재현합니다
+python training/verify_both_splits.py
+
+# 네이티브 리눅스에서 컨테이너 실행 시간을 잽니다
+bash training/native_timing.sh
+```
+
+| | dev | train |
+|---|---|---|
+| 최종 점수 (등급 가중 0.4 / 0.3 / 0.3) | 0.665199 | 0.671662 |
+| fast 예산 비율 (한도 1.25) | 1.0540 | 1.0443 |
+| balanced 예산 비율 (한도 2.00) | 1.5136 | 1.5088 |
+| premium 예산 비율 (한도 4.00) | 2.1192 | 1.9488 |
+
+공개 두 split 으로 안전계수를 정했으므로 이 값은 비공개 평가 점수의 추정치가
+아닙니다. 실행 시간은 공식 자원 한도에서 네이티브 리눅스 기준 등급당 5.0초로,
+한도 90초 대비 18배 여유가 있습니다.
+
+## 저장소 구조
+
+| 경로 | 내용 |
+|---|---|
+| `src/ossp_router/heuristic.py` | 라우터 본체 — 특징 추출, 예측, 배분 |
+| `training/artifact.json` | 릿지 계수 2,952개와 배분 파라미터 |
+| `training/verify_both_splits.py` | 공식 채점기로 두 split 재현 |
+| `training/private_set_stress.py` | 채점셋 구성을 흔들어 예산 초과를 찾는다 |
+| `training/stress_scenarios.py` | 비용이 관측 범위를 벗어났을 때를 본다 |
+| `training/audit_operating_point.py` | k=5000 부트스트랩 + Clopper-Pearson 상한 |
+| `container/Dockerfile` | linux/arm64 이미지. pip·setuptools·wheel 제거 |
+
+## 실험 기록
+
+채택한 것뿐 아니라 기각한 것도 태그로 남겼습니다.
+
+```console
+git tag -n1 | grep experiment/
+```
+
+| 태그 | 결과 |
+|---|---|
+| `submission/v22f` | 출품한 설정 |
+| `experiment/v23-rejected` | 기각 — 운용점이 잡음 골짜기에 있었고 감사에서 0.721%가 나왔다 |
+| `experiment/v24-rejected` | 기각 — 공동적응 가설이 틀렸다. 탐색 결과가 고정점보다 나빴다 |
+| `experiment/v4-bagging` 외 | 배깅·차등 정규화·마커 확장 등 |
+
+## 한계
+
+승격 이득 자체를 예측하지 못합니다. 모델별 품질 점수는 교차검증 상관 +0.44로
+어느 정도 맞히지만, 배분에 필요한 것은 두 모델의 **차이**입니다. 기준선 모델과
+중급 모델의 실측 점수 상관이 0.69로 높아 대부분 문항에서 둘이 같은 답을 내고,
+차이는 개별 변동에 묻힙니다. 승격 이득의 예측 상관은 +0.056에 그칩니다.
+실제로 승격해서 점수가 오르는 문항은 18%뿐이라, 같은 지출에서 완벽한 순위와
+비교하면 얻을 수 있는 개선의 약 34%만 회수합니다.
+
+## 라이선스
+
+직접 작성한 코드는 Apache License 2.0 입니다. 아래는 주최측이 배포한 원본
+과제 안내이며 저작권은 SK텔레콤에 있습니다.
+
+---
 
 # Efficient LLM Routing Challenge
 
