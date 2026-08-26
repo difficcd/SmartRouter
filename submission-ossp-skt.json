@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "challenge_id": "ossp-2026-llm-router-challenge",
+  "repository_url": "https://github.com/difficcd/SmartRouter",
+  "commit_sha": "2dda3ef1c48bfaa601a8facf962911f9b5d57179",
+  "image_digest": "ghcr.io/difficcd/smartrouter@sha256:b7e04a8cab897716da06a0daa63b017ae8d4b375f49cab206e9cbee3a6b642d8",
+  "primary_license": "Apache-2.0"
+}
